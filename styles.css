@@ -254,3 +254,31 @@ body.locked .tabbar, body.locked .sync { display: none; }
 .hweek { margin-top: 18px; }
 details summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 .btn.small { padding: 6px 12px; font-size: .85rem; }
+
+/* Version 3: familjer */
+.brand-l { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
+.fam {
+  border: 0; background: none; padding: 0; margin-top: 1px; color: var(--accent); font-weight: 600; font-size: .88rem;
+  max-width: 60vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.linkbtn { border: 0; background: none; padding: 0; color: var(--accent); font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
+.login .switch { margin-top: 18px; }
+.ok { color: var(--accent); font-weight: 600; margin: 0 0 14px; }
+.onboard { max-width: 520px; }
+.famforms { display: grid; gap: 14px; }
+.famcard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; }
+.famcard h3 { font-size: 1.15rem; margin-bottom: 4px; }
+.famcard > p { margin: 0 0 12px; }
+.check { display: flex; align-items: center; gap: 8px; margin: -4px 0 14px; }
+.check input { width: 20px; height: 20px; accent-color: var(--accent); }
+.code-input { text-transform: uppercase; letter-spacing: .18em; font-variant-numeric: tabular-nums; }
+.invite { display: flex; align-items: baseline; gap: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; }
+.invite .code { font-family: var(--f-display); font-size: 1.7rem; letter-spacing: .14em; font-variant-numeric: tabular-nums; }
+.linktext { overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; margin: 8px 0 0; }
+.members, .famlist { list-style: none; margin: 6px 0 0; padding: 0; }
+.members li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-block: 10px; border-bottom: 1px solid var(--line); }
+.members .mname { font-weight: 600; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.members .mact { display: flex; gap: 6px; }
+.famlist button { width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: none; padding: 12px 4px; font-weight: 600; }
+.famlist button.cur { color: var(--accent); }
+.who { margin: 6px 0 0; }

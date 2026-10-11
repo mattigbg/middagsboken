@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "2";
+  const APP_VERSION = "3";
 
   // ---------- hjälpfunktioner ----------
   const DAYS = ["Måndag", "Tisdag", "Onsdag", "Torsdag", "Fredag", "Lördag", "Söndag"];
@@ -47,28 +47,40 @@
   // ---------- lagring: Supabase i molnet, med kopia i telefonen ----------
   const CFG = window.MIDDAG_CONFIG || {};
   const CLOUD = !!(CFG.supabaseUrl && CFG.supabaseKey && window.supabase);
-  const K_CACHE = "mb-cache", K_OUTBOX = "mb-outbox";
+  const K_OUTBOX = "mb-outbox", K_FAMILY = "mb-family", K_JOIN = "mb-join";
+  const cacheKey = fid => "mb-cache-" + (fid || "local");
   const BUCKET = "bilder";
-  const opKey = op => ({ r: "r", rd: "r", w: "w", rt: "t" }[op.k]) + ":" + op.id;
+  const opKey = op => (op.fid || "") + "/" + ({ r: "r", rd: "r", w: "w", rt: "t" }[op.k]) + ":" + op.id;
 
   const store = {
     sb: null, user: null, me: CLOUD ? null : "me",
+    family: null,          // id för vald familj
+    families: [],          // [{id, name, invite_code, role}]
+    members: {},           // user_id -> {name, role} i vald familj
     recipes: {}, weeks: {}, ratings: {},
     outbox: lsGet(K_OUTBOX, []),
     flushing: false, channel: null, needsDbUpdate: false,
 
+    get current() { return this.families.find(f => f.id === this.family) || null; },
+    get myName() {
+      const m = this.user && this.user.user_metadata;
+      return (m && m.name) || (this.user && this.user.email ? this.user.email.split("@")[0] : "");
+    },
+
     saveCache() {
-      if (!lsSet(K_CACHE, { recipes: this.recipes, weeks: this.weeks, ratings: this.ratings }) && !CLOUD) {
-        toast("Telefonens lagring är full. Ta bort några bilder.");
-      }
+      const ok = lsSet(cacheKey(this.family), { recipes: this.recipes, weeks: this.weeks, ratings: this.ratings, members: this.members });
+      if (!ok && !CLOUD) toast("Telefonens lagring är full. Ta bort några bilder.");
+      if (CLOUD) lsSet("mb-families", this.families);
     },
     loadCache() {
-      const c = lsGet(K_CACHE, null);
-      if (c) { this.recipes = c.recipes || {}; this.weeks = c.weeks || {}; this.ratings = c.ratings || {}; }
+      const c = lsGet(cacheKey(this.family), null);
+      this.recipes = (c && c.recipes) || {}; this.weeks = (c && c.weeks) || {};
+      this.ratings = (c && c.ratings) || {}; this.members = (c && c.members) || {};
       return !!c;
     },
 
     apply(op) {
+      if (CLOUD && op.fid !== this.family) return; // ändringen gäller en annan familj
       if (op.k === "r") this.recipes[op.id] = op.data;
       else if (op.k === "rd") { delete this.recipes[op.id]; delete this.ratings[op.id]; }
       else if (op.k === "w") this.weeks[op.id] = op.data;
@@ -81,6 +93,7 @@
 
     // Alla ändringar går hit: visas direkt, sparas i molnet så fort det går.
     change(op) {
+      op = { ...op, fid: op.fid || this.family };
       this.apply(op);
       this.saveCache();
       if (CLOUD) {
@@ -102,16 +115,17 @@
           const op = this.outbox[0];
           let res;
           const now = new Date().toISOString();
-          if (op.k === "r") res = await this.sb.from("recipes").upsert({ id: op.id, ...recipeToRow(op.data), updated_at: now });
+          if (!op.fid) res = { error: null };
+          else if (op.k === "r") res = await this.sb.from("recipes").upsert({ id: op.id, family_id: op.fid, ...recipeToRow(op.data), updated_at: now });
           else if (op.k === "rd") res = await this.sb.from("recipes").delete().eq("id", op.id);
-          else if (op.k === "w") res = await this.sb.from("weeks").upsert({ id: op.id, data: op.data, updated_at: now });
+          else if (op.k === "w") res = await this.sb.from("weeks").upsert({ family_id: op.fid, id: op.id, data: op.data, updated_at: now }, { onConflict: "family_id,id" });
           else if (op.k === "rt") res = op.stars
             ? await this.sb.from("ratings").upsert({ recipe_id: op.id, user_id: this.me, stars: op.stars, updated_at: now })
             : await this.sb.from("ratings").delete().eq("recipe_id", op.id).eq("user_id", this.me);
           if (res.error) {
             if (isNetworkError(res.error)) { setSync("Offline", "warn"); return; }
             if (isAuthError(res.error)) { await this.sb.auth.refreshSession().catch(() => {}); setSync("Logga in igen", "warn"); return; }
-            if (isSchemaError(res.error)) { this.needsDbUpdate = true; setSync("Databasen behöver uppdateras", "warn"); return; }
+            if (isSchemaError(res.error)) { this.needsDbUpdate = true; setSync("Databasen behöver uppdateras", "warn"); render(); return; }
             console.error(res.error);
             toast("En ändring kunde inte sparas: " + (res.error.message || "okänt fel"));
           }
@@ -126,13 +140,31 @@
       }
     },
 
+    // Hämtar vilka familjer man är med i.
+    async loadFamilies() {
+      const { data, error } = await this.sb.from("family_members")
+        .select("role, families(id, name, invite_code)").eq("user_id", this.me);
+      if (error) {
+        if (isSchemaError(error)) { this.needsDbUpdate = true; return "schema"; }
+        this.families = lsGet("mb-families", []);
+        return isNetworkError(error) ? "offline" : "error";
+      }
+      this.families = (data || []).filter(r => r.families).map(r => ({ ...r.families, role: r.role }))
+        .sort((a, b) => a.name.localeCompare(b.name, "sv"));
+      lsSet("mb-families", this.families);
+      return "ok";
+    },
+
     async pull() {
-      if (!CLOUD || !this.user) return;
-      const [r, w, t] = await Promise.all([
-        this.sb.from("recipes").select("*"),
-        this.sb.from("weeks").select("*"),
-        this.sb.from("ratings").select("recipe_id,user_id,stars")
+      if (!CLOUD || !this.user || !this.family) return;
+      const fid = this.family;
+      const [r, w, t, m] = await Promise.all([
+        this.sb.from("recipes").select("*").eq("family_id", fid),
+        this.sb.from("weeks").select("*").eq("family_id", fid),
+        this.sb.from("ratings").select("recipe_id,user_id,stars"),
+        this.sb.from("family_members").select("user_id,display_name,role").eq("family_id", fid)
       ]);
+      if (fid !== this.family) return; // familjen byttes medan vi hämtade
       if (r.error || w.error) {
         const e = r.error || w.error;
         setSync(isNetworkError(e) ? "Offline" : "Kunde inte hämta", "warn");
@@ -142,8 +174,8 @@
       const weeks = {}; w.data.forEach(row => weeks[row.id] = row.data || {});
       const ratings = {};
       if (t.error) this.needsDbUpdate = true;
-      else (t.data || []).forEach(row => { (ratings[row.recipe_id] = ratings[row.recipe_id] || {})[row.user_id] = row.stars; });
-      if (r.data[0] && !("image" in r.data[0])) this.needsDbUpdate = true;
+      else (t.data || []).forEach(row => { if (recipes[row.recipe_id]) (ratings[row.recipe_id] = ratings[row.recipe_id] || {})[row.user_id] = row.stars; });
+      if (!m.error) { const mem = {}; m.data.forEach(x => mem[x.user_id] = { name: x.display_name, role: x.role }); this.members = mem; }
       this.recipes = recipes; this.weeks = weeks; this.ratings = ratings;
       this.outbox.forEach(op => this.apply(op)); // ändringar som inte hunnit sparas ligger kvar
       this.saveCache();
@@ -154,16 +186,18 @@
     },
 
     subscribe() {
-      if (this.channel) this.sb.removeChannel(this.channel);
-      const pending = key => this.outbox.some(o => opKey(o) === key);
-      this.channel = this.sb.channel("middagsboken")
-        .on("postgres_changes", { event: "*", schema: "public", table: "recipes" }, p => {
+      if (this.channel) { this.sb.removeChannel(this.channel); this.channel = null; }
+      if (!this.family) return;
+      const fid = this.family, filter = "family_id=eq." + fid;
+      const pending = key => this.outbox.some(o => opKey(o) === fid + "/" + key);
+      this.channel = this.sb.channel("middagsboken-" + fid)
+        .on("postgres_changes", { event: "*", schema: "public", table: "recipes", filter }, p => {
           const id = (p.new && p.new.id) || (p.old && p.old.id);
           if (!id || pending("r:" + id)) return;
           if (p.eventType === "DELETE") { delete this.recipes[id]; delete this.ratings[id]; } else this.recipes[id] = rowToRecipe(p.new);
           this.saveCache(); render();
         })
-        .on("postgres_changes", { event: "*", schema: "public", table: "weeks" }, p => {
+        .on("postgres_changes", { event: "*", schema: "public", table: "weeks", filter }, p => {
           const id = (p.new && p.new.id) || (p.old && p.old.id);
           if (!id || pending("w:" + id)) return;
           if (p.eventType === "DELETE") delete this.weeks[id]; else this.weeks[id] = p.new.data || {};
@@ -171,14 +205,44 @@
         })
         .on("postgres_changes", { event: "*", schema: "public", table: "ratings" }, p => {
           const row = p.eventType === "DELETE" ? p.old : p.new;
-          if (!row || !row.recipe_id || !row.user_id) return;
+          if (!row || !row.recipe_id || !row.user_id || !this.recipes[row.recipe_id]) return;
           if (row.user_id === this.me && pending("t:" + row.recipe_id)) return;
           const cur = { ...(this.ratings[row.recipe_id] || {}) };
           if (p.eventType === "DELETE") delete cur[row.user_id]; else cur[row.user_id] = row.stars;
           this.ratings[row.recipe_id] = cur;
           this.saveCache(); render();
         })
+        .on("postgres_changes", { event: "*", schema: "public", table: "family_members", filter }, () => {
+          this.refreshMembers();
+        })
         .subscribe();
+    },
+
+    async refreshMembers() {
+      const fid = this.family;
+      const [m] = await Promise.all([
+        this.sb.from("family_members").select("user_id,display_name,role").eq("family_id", fid),
+        this.loadFamilies()
+      ]);
+      if (fid !== this.family) return;
+      if (!this.families.some(f => f.id === fid)) { toast("Du är inte längre med i familjen"); chooseFamily(); return; }
+      if (!m.error) { const mem = {}; m.data.forEach(x => mem[x.user_id] = { name: x.display_name, role: x.role }); this.members = mem; this.saveCache(); }
+      renderHeader(); render();
+    },
+
+    async switchFamily(fid) {
+      this.family = fid; lsSet(K_FAMILY, fid);
+      if (this.outbox.some(o => !o.fid)) { this.outbox.forEach(o => { if (!o.fid) o.fid = fid; }); lsSet(K_OUTBOX, this.outbox); }
+      lsDel("mb-cache");
+      this.needsDbUpdate = false;
+      this.loadCache();
+      state.loaded = Object.keys(this.recipes).length > 0;
+      state.offset = 0; state.tag = ""; state.q = "";
+      closeSheet();
+      document.body.classList.remove("locked");
+      renderHeader(); render();
+      this.subscribe();
+      await this.refresh();
     },
 
     async refresh() { await this.flush(); await this.pull(); },
@@ -186,9 +250,11 @@
     async signOut() {
       if (this.channel) { this.sb.removeChannel(this.channel); this.channel = null; }
       await this.sb.auth.signOut().catch(() => {});
-      this.user = null; this.me = null; this.recipes = {}; this.weeks = {}; this.ratings = {}; this.outbox = [];
-      lsDel(K_CACHE); lsDel(K_OUTBOX);
-      closeSheet(); showLogin();
+      Object.keys(localStorage).filter(k => k.startsWith("mb-cache-")).forEach(lsDel);
+      ["mb-families", K_FAMILY, K_OUTBOX].forEach(lsDel);
+      this.user = null; this.me = null; this.family = null; this.families = []; this.members = {};
+      this.recipes = {}; this.weeks = {}; this.ratings = {}; this.outbox = [];
+      closeSheet(); renderHeader(); showLogin();
     }
   };
 
@@ -203,7 +269,7 @@
   const errText = e => ((e && (e.message || e.details || e.code)) || "") + "";
   const isNetworkError = e => !navigator.onLine || /fetch|network|load failed|timeout/i.test(errText(e));
   const isAuthError = e => /jwt|token|401|not authenticated/i.test(errText(e));
-  const isSchemaError = e => /column|relation|schema cache|does not exist|PGRST20/i.test(errText(e));
+  const isSchemaError = e => /column|relation|schema cache|does not exist|PGRST20|function .* not found|Could not find/i.test(errText(e));
 
   // ---------- bilder ----------
   async function shrinkImage(file, max) {
@@ -224,7 +290,7 @@
     }
     if (!navigator.onLine) throw new Error("offline");
     const blob = await shrinkImage(file, 1400);
-    const path = `${store.me}/${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}.jpg`;
+    const path = `${store.family || store.me}/${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}.jpg`;
     const { error } = await store.sb.storage.from(BUCKET).upload(path, blob, { contentType: "image/jpeg", cacheControl: "31536000" });
     if (error) throw error;
     return store.sb.storage.from(BUCKET).getPublicUrl(path).data.publicUrl;
@@ -287,7 +353,7 @@
     const active = document.activeElement && document.activeElement.id;
     const y = window.scrollY;
     main.replaceChildren();
-    if (store.needsDbUpdate) main.append(h(`<div class="hint-card warn"><p><b>Databasen behöver uppdateras.</b> Kör filen supabase-setup.sql en gång till i Supabase (SQL Editor) för att bilder och betyg ska sparas.</p></div>`));
+    if (store.needsDbUpdate) main.append(h(`<div class="hint-card warn"><p><b>Databasen behöver uppdateras.</b> Kör filen supabase-setup.sql en gång till i Supabase (SQL Editor), så fungerar allt.</p></div>`));
     if (state.tab === "week") renderWeek(main);
     else if (state.tab === "recipes") renderRecipes(main);
     else renderShop(main);
@@ -604,9 +670,27 @@
       ${eaten.length > 1 ? `<details class="section"><summary class="small">Alla gånger ni ätit den</summary><p class="small muted">${eaten.map(fmtDateYear).join(", ")}</p></details>` : ""}
       <div class="section"${dayIndex != null ? " hidden" : ""}><div class="label">Lägg på veckomenyn, vecka ${isoWeek(monday()).week}</div>
         <div class="row" style="margin-top:6px"><select id="addday" class="btn">${DAYS.map((d, i) => `<option value="${i}">${d} ${fmtDate(addDays(monday(), i))}</option>`).join("")}</select><button class="btn primary" id="addgo">Lägg till</button></div></div>
-      <div class="row section"><button class="btn" id="edit">Redigera</button><button class="btn danger" id="del">Ta bort</button></div></div>`);
+      <div class="row section"><button class="btn" id="edit">Redigera</button>${CLOUD && store.families.length > 1 ? `<button class="btn" id="copyfam">Kopiera till annan familj</button>` : ""}<button class="btn danger" id="del">Ta bort</button></div></div>`);
     box.prepend(closeBtn());
     $(".rate", box).append(starsInput(rt.mine, v => { store.change({ k: "rt", id, stars: v }); toast(v ? `Du gav ${v} av 5` : "Betyget borttaget"); openRecipe(id, dayIndex); }));
+    const others = Object.entries(store.ratings[id] || {}).filter(([uid, n]) => n && uid !== store.me && CLOUD);
+    if (others.length) $(".rate", box).after(h(`<p class="small muted who">${others.map(([uid, n]) => `${esc((store.members[uid] && store.members[uid].name) || "Tidigare medlem")} ${"★".repeat(n)}`).join(" · ")}</p>`));
+    const cp = $("#copyfam", box);
+    if (cp) cp.onclick = () => {
+      const opts = store.families.filter(f => f.id !== store.family);
+      const b2 = h(`<div><h2>Kopiera till en annan familj</h2><p class="small muted">Receptet kopieras med ingredienser, steg och bild. Betyg och historik följer inte med.</p><ul class="famlist"></ul></div>`);
+      b2.prepend(closeBtn());
+      opts.forEach(f => {
+        const li = h(`<li><button>${esc(f.name)}</button></li>`);
+        $("button", li).onclick = async () => {
+          const { error } = await store.sb.from("recipes").insert({ id: newId(), family_id: f.id, ...recipeToRow(r) });
+          if (error) { toast(rpcError(error, "Receptet kunde inte kopieras.")); return; }
+          closeSheet(); toast(`Kopierat till ${f.name}`);
+        };
+        $(".famlist", b2).append(li);
+      });
+      openSheet(b2);
+    };
     if (dayIndex != null) {
       $("#swap", box).onclick = () => openPicker(dayIndex);
       $("#unplan", box).onclick = () => { setDay(dayIndex, { recipeId: "", note: "" }); closeSheet(); toast("Borttagen från " + DAYS[dayIndex].toLowerCase()); };
@@ -842,6 +926,219 @@
     }
   }
 
+  // ---------- sidhuvud ----------
+  function renderHeader() {
+    const b = $("#fam");
+    const f = CLOUD && store.user && store.current;
+    b.hidden = !f;
+    if (f) b.textContent = f.name + " ▾";
+  }
+  $("#fam").addEventListener("click", openFamily);
+
+  // ---------- familj ----------
+  const inviteLink = code => location.origin + location.pathname + "?join=" + encodeURIComponent(code);
+
+  async function rpc(name, args) {
+    const { data, error } = await store.sb.rpc(name, args);
+    if (error) throw error;
+    return data;
+  }
+  function rpcError(e, fallback) {
+    const t = errText(e);
+    if (/Okänd kod/.test(t)) return "Koden finns inte. Kontrollera att den är rätt skriven.";
+    if (isNetworkError(e)) return "Ingen internetanslutning. Försök igen när du är online.";
+    if (isSchemaError(e)) return "Databasen behöver uppdateras. Kör supabase-setup.sql i Supabase.";
+    return fallback;
+  }
+
+  async function createFamily(name, withSeed) {
+    const fid = await rpc("create_family", { p_name: name, p_display: store.myName });
+    await store.loadFamilies();
+    await store.switchFamily(fid);
+    if (withSeed) (window.MIDDAG_SEED || []).forEach(({ id, ...r }) => store.change({ k: "r", id: newId() + id.slice(0, 3), data: r }));
+    toast(`Familjen "${name}" är skapad`);
+  }
+  async function joinFamily(code) {
+    const fid = await rpc("join_family", { p_code: code, p_display: store.myName });
+    lsDel(K_JOIN);
+    await store.loadFamilies();
+    await store.switchFamily(fid);
+    toast(`Välkommen till ${store.current ? store.current.name : "familjen"}!`);
+  }
+
+  // Formulär för att skapa eller gå med, används både första gången och från familjemenyn.
+  function familyForms(code) {
+    const el = h(`<div class="famforms">
+      <form class="famcard" id="fc">
+        <h3>Skapa en familj</h3>
+        <p class="small muted">Du blir ägare och kan sedan bjuda in andra.</p>
+        <div class="field"><label for="fn">Familjens namn</label><input id="fn" required placeholder="T.ex. Familjen Lind" maxlength="40"></div>
+        <label class="check small"><input type="checkbox" id="fseed" checked> Börja med 8 startrecept</label>
+        <p class="err small" hidden></p>
+        <button class="btn primary" type="submit">Skapa familj</button>
+      </form>
+      <form class="famcard" id="fj">
+        <h3>Gå med i en familj</h3>
+        <p class="small muted">Be någon i familjen om inbjudningskoden. Den finns under familjens namn högst upp i appen.</p>
+        <div class="field"><label for="fcode">Inbjudningskod</label><input id="fcode" required placeholder="T.ex. 7K3F9A" maxlength="6" autocapitalize="characters" autocomplete="off" value="${esc(code || "")}" class="code-input"></div>
+        <p class="err small" hidden></p>
+        <button class="btn primary" type="submit">Gå med</button>
+      </form></div>`);
+    const err = (form, t) => { const p = $(".err", form); p.hidden = !t; p.textContent = t || ""; };
+    $("#fc", el).onsubmit = async e => {
+      e.preventDefault(); const f = e.currentTarget, btn = $("button[type=submit]", f);
+      btn.disabled = true; err(f, "");
+      try { await createFamily($("#fn", f).value.trim(), $("#fseed", f).checked); }
+      catch (x) { err(f, rpcError(x, "Familjen kunde inte skapas. Försök igen.")); }
+      finally { btn.disabled = false; }
+    };
+    $("#fj", el).onsubmit = async e => {
+      e.preventDefault(); const f = e.currentTarget, btn = $("button[type=submit]", f);
+      btn.disabled = true; err(f, "");
+      try { await joinFamily($("#fcode", f).value.trim()); }
+      catch (x) { err(f, rpcError(x, "Det gick inte att gå med. Försök igen.")); }
+      finally { btn.disabled = false; }
+    };
+    return el;
+  }
+
+  function showOnboarding() {
+    document.body.classList.add("locked");
+    store.family = null; renderHeader();
+    const box = h(`<div class="login onboard">
+      <img class="logo" src="icons/apple-touch-icon.png" alt="">
+      <h2>Hej ${esc(store.myName)}!</h2>
+      <p>För att komma igång skapar du en familj eller går med i en som redan finns. Du kan vara med i flera familjer, till exempel ert hushåll och en syskongrupp.</p>
+    </div>`);
+    box.append(familyForms(lsGet(K_JOIN, "")));
+    const out = h(`<p class="small" style="margin-top:20px"><button type="button" class="btn">Logga ut</button></p>`);
+    $("button", out).onclick = () => store.signOut();
+    box.append(out);
+    $("#main").replaceChildren(box);
+  }
+
+  async function openJoinPrompt(code) {
+    let name = null;
+    try { name = await rpc("family_name_by_code", { p_code: code }); } catch (e) {
+      if (isNetworkError(e)) return; // försök igen nästa gång appen öppnas
+    }
+    if (!name) { lsDel(K_JOIN); toast("Inbjudan gäller inte längre. Be om en ny kod."); return; }
+    const already = store.families.find(f => f.invite_code === code.toUpperCase());
+    if (already) { lsDel(K_JOIN); if (already.id !== store.family) store.switchFamily(already.id); return; }
+    const box = h(`<div><h2>Du är inbjuden</h2>
+      <p>Vill du gå med i <b>${esc(name)}</b>? Då ser du familjens recept, veckomeny och inköpslista, och kan ändra i dem.</p>
+      <p class="err small" hidden></p>
+      <div class="row"><button class="btn primary" id="jy">Gå med</button><button class="btn" id="jn">Inte nu</button></div></div>`);
+    $("#jy", box).onclick = async () => {
+      try { await joinFamily(code); } catch (x) { const p = $(".err", box); p.hidden = false; p.textContent = rpcError(x, "Det gick inte att gå med."); }
+    };
+    $("#jn", box).onclick = () => { lsDel(K_JOIN); closeSheet(); };
+    openSheet(box);
+  }
+
+  function chooseFamily() {
+    const saved = lsGet(K_FAMILY, null);
+    const f = store.families.find(x => x.id === saved) || store.families[0];
+    if (f) store.switchFamily(f.id); else showOnboarding();
+  }
+
+  function openFamily() {
+    const f = store.current; if (!f) return;
+    const owner = f.role === "owner";
+    const ids = Object.keys(store.members).sort((a, b) => (store.members[a].name || "").localeCompare(store.members[b].name || "", "sv"));
+    const box = h(`<div class="family">
+      <h2>${esc(f.name)}</h2>
+      <p class="small muted" style="margin:0">${ids.length === 1 ? "1 medlem" : ids.length + " medlemmar"}${owner ? " · du är ägare" : ""}</p>
+      ${owner ? `<form class="addline" id="rn" style="margin-top:12px"><input id="rnn" value="${esc(f.name)}" maxlength="40" aria-label="Familjens namn"><button class="btn" type="submit">Byt namn</button></form>` : ""}
+
+      <div class="section"><h3>Bjud in</h3>
+        <p class="small muted" style="margin:0 0 10px">Skicka länken till den som ska vara med, eller ge dem koden. De skapar ett eget konto och kommer direkt in i familjen.</p>
+        <div class="invite"><span class="label">Kod</span><span class="code">${esc(f.invite_code)}</span></div>
+        <div class="row" style="margin-top:10px"><button class="btn primary" id="share">Dela inbjudan</button><button class="btn" id="copy">Kopiera länk</button>${owner ? `<button class="btn" id="newcode">Ny kod</button>` : ""}</div>
+        <p class="small muted linktext" id="lt">${esc(inviteLink(f.invite_code))}</p>
+      </div>
+
+      <div class="section"><h3>Medlemmar</h3><ul class="members"></ul></div>
+
+      ${store.families.length > 1 ? `<div class="section"><h3>Dina familjer</h3><ul class="famlist"></ul></div>` : ""}
+
+      <div class="section row"><button class="btn" id="newfam">Skapa eller gå med i en annan familj</button></div>
+      <div class="section row"><button class="btn danger" id="leave">Lämna ${esc(f.name)}</button></div>
+    </div>`);
+    box.prepend(closeBtn());
+
+    const ul = $(".members", box);
+    ids.forEach(uid => {
+      const m = store.members[uid], me = uid === store.me;
+      const li = h(`<li><span class="mname">${esc(m.name || "Namnlös")}${me ? " <span class='muted'>(du)</span>" : ""}</span>${m.role === "owner" ? `<span class="tag">Ägare</span>` : ""}<span class="mact"></span></li>`);
+      if (owner && !me) {
+        const act = $(".mact", li);
+        if (m.role !== "owner") {
+          const up = h(`<button class="btn small">Gör till ägare</button>`);
+          up.onclick = async () => { try { await rpc("set_member_role", { fid: f.id, uid, p_role: "owner" }); await store.refreshMembers(); openFamily(); } catch (e) { toast(rpcError(e, "Det gick inte.")); } };
+          act.append(up);
+        }
+        const rm = h(`<button class="btn small danger">Ta bort</button>`);
+        rm.onclick = async () => {
+          if (!rm.classList.contains("armed")) { rm.classList.add("armed"); rm.textContent = "Ja, ta bort"; return; }
+          const { error } = await store.sb.from("family_members").delete().eq("family_id", f.id).eq("user_id", uid);
+          if (error) { toast(rpcError(error, "Det gick inte att ta bort.")); return; }
+          await store.refreshMembers(); openFamily(); toast(`${m.name || "Medlemmen"} är borttagen`);
+        };
+        act.append(rm);
+      }
+      ul.append(li);
+    });
+
+    const fl = $(".famlist", box);
+    if (fl) store.families.forEach(x => {
+      const li = h(`<li><button class="${x.id === f.id ? "cur" : ""}">${esc(x.name)}${x.id === f.id ? " ✓" : ""}</button></li>`);
+      $("button", li).onclick = () => { if (x.id !== f.id) store.switchFamily(x.id); };
+      fl.append(li);
+    });
+
+    const rn = $("#rn", box);
+    if (rn) rn.onsubmit = async e => {
+      e.preventDefault(); const name = $("#rnn", box).value.trim(); if (!name || name === f.name) return;
+      const { error } = await store.sb.from("families").update({ name }).eq("id", f.id);
+      if (error) { toast(rpcError(error, "Namnet kunde inte sparas.")); return; }
+      await store.loadFamilies(); renderHeader(); openFamily(); toast("Namnet är ändrat");
+    };
+    const link = inviteLink(f.invite_code);
+    const text = `Häng med i "${f.name}" i Middagsboken, så planerar vi middagarna tillsammans. Öppna länken och skapa ett konto: ${link} (kod ${f.invite_code})`;
+    const copy = async () => {
+      try { await navigator.clipboard.writeText(link); toast("Länken är kopierad"); }
+      catch { const r = document.createRange(); r.selectNodeContents($("#lt", box)); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); toast("Markerad. Välj Kopiera."); }
+    };
+    $("#share", box).onclick = async () => {
+      if (navigator.share) { try { await navigator.share({ title: "Middagsboken", text }); } catch {} }
+      else copy();
+    };
+    $("#copy", box).onclick = copy;
+    const nc = $("#newcode", box);
+    if (nc) nc.onclick = async () => {
+      if (!nc.classList.contains("armed")) { nc.classList.add("armed"); nc.textContent = "Ja, ny kod"; toast("Den gamla koden och länken slutar fungera"); return; }
+      try { await rpc("new_invite_code", { fid: f.id }); await store.loadFamilies(); openFamily(); toast("Ny kod skapad"); }
+      catch (e) { toast(rpcError(e, "Det gick inte att byta kod.")); }
+    };
+    $("#newfam", box).onclick = () => {
+      const b2 = h(`<div><h2>Fler familjer</h2></div>`); b2.prepend(closeBtn()); b2.append(familyForms("")); openSheet(b2);
+    };
+    const lv = $("#leave", box);
+    lv.onclick = async () => {
+      if (!lv.classList.contains("armed")) {
+        lv.classList.add("armed");
+        lv.textContent = ids.length === 1 ? "Ja, lämna (familjen raderas inte)" : "Ja, lämna familjen";
+        return;
+      }
+      const { error } = await store.sb.from("family_members").delete().eq("family_id", f.id).eq("user_id", store.me);
+      if (error) { toast(rpcError(error, "Det gick inte att lämna.")); return; }
+      lsDel(cacheKey(f.id)); lsDel(K_FAMILY);
+      await store.loadFamilies(); closeSheet(); toast(`Du har lämnat ${f.name}`); chooseFamily();
+    };
+    openSheet(box);
+  }
+
   // ---------- inställningar ----------
   function openSettings() {
     const box = h(`<div class="settings">
@@ -849,19 +1146,33 @@
       <dl>
         <dt>Status</dt><dd>${esc($("#sync").textContent)}</dd>
         ${CLOUD && store.user ? `<dt>Inloggad</dt><dd>${esc(store.user.email)}</dd>` : ""}
+        ${CLOUD && store.current ? `<dt>Familj</dt><dd>${esc(store.current.name)}</dd>` : ""}
         ${!CLOUD ? `<dt>Läge</dt><dd>Testläge. Allt sparas bara på den här enheten.</dd>` : ""}
         ${store.outbox.length ? `<dt>Väntar</dt><dd>${store.outbox.length} ändringar sparas när du är online</dd>` : ""}
         <dt>Recept</dt><dd>${recipeList().length} st</dd>
         <dt>Version</dt><dd>${APP_VERSION}</dd>
       </dl>
+      ${CLOUD && store.user ? `<form class="field" id="myname"><label for="mn">Ditt namn (syns för familjen)</label><div class="addline" style="margin-top:0"><input id="mn" value="${esc(store.myName)}" maxlength="30"><button class="btn" type="submit">Spara</button></div></form>` : ""}
       <div class="row" id="acts"></div>
       ${!isStandalone ? `<div class="section"><div class="label">Installera</div><p class="small">Öppna sidan i Safari, tryck på Dela och välj <b>Lägg till på hemskärmen</b>.</p></div>` : ""}
     </div>`);
     box.prepend(closeBtn());
     const acts = $("#acts", box);
     if (CLOUD && store.user) {
+      $("#myname", box).onsubmit = async e => {
+        e.preventDefault(); const name = $("#mn", box).value.trim(); if (!name) return;
+        const { data, error } = await store.sb.auth.updateUser({ data: { name } });
+        if (error) { toast(rpcError(error, "Namnet kunde inte sparas.")); return; }
+        store.user = data.user;
+        try { await rpc("set_display_name", { p_name: name }); } catch {}
+        if (store.family) await store.refreshMembers();
+        toast("Namnet är sparat");
+      };
+      if (store.current) {
+        const fam = h(`<button class="btn">Familj och inbjudan</button>`); fam.onclick = openFamily; acts.append(fam);
+      }
       const rf = h(`<button class="btn">Uppdatera nu</button>`);
-      rf.onclick = async () => { rf.disabled = true; store.needsDbUpdate = false; await store.refresh(); closeSheet(); toast("Uppdaterad"); };
+      rf.onclick = async () => { rf.disabled = true; store.needsDbUpdate = false; await store.loadFamilies(); await store.refresh(); closeSheet(); toast("Uppdaterad"); };
       const pw = h(`<button class="btn">Byt lösenord</button>`);
       pw.onclick = () => openNewPassword(false);
       const out = h(`<button class="btn danger">Logga ut</button>`);
@@ -887,54 +1198,103 @@
     openSheet(box);
   }
 
-  // ---------- inloggning ----------
-  function showLogin(message) {
+  // ---------- inloggning och konto ----------
+  function showLogin(message, mode) {
     document.body.classList.add("locked");
-    const main = $("#main");
+    const invited = !!lsGet(K_JOIN, "");
+    mode = mode || (invited ? "signup" : "login");
+    const signup = mode === "signup";
     const box = h(`<form class="login">
       <img class="logo" src="icons/apple-touch-icon.png" alt="">
-      <h2>Välkommen</h2>
-      <p>Logga in för att se familjens recept och veckomeny.</p>
+      <h2>${signup ? "Skapa konto" : "Välkommen"}</h2>
+      <p>${invited ? "Du har blivit inbjuden till en familj i Middagsboken. " : ""}${signup ? "Fyll i dina uppgifter. Sedan skapar du en familj eller går med i en." : "Logga in för att se familjens recept och veckomeny."}</p>
       <p class="err" ${message ? "" : "hidden"}>${esc(message || "")}</p>
+      ${signup ? `<div class="field"><label for="ln">Ditt namn</label><input id="ln" autocomplete="given-name" required maxlength="30" placeholder="Det här ser familjen"></div>` : ""}
       <div class="field"><label for="le">E-post</label><input id="le" type="email" autocomplete="email" autocapitalize="off" required></div>
-      <div class="field"><label for="lp">Lösenord</label><input id="lp" type="password" autocomplete="current-password" required></div>
-      <button class="btn primary wide" type="submit">Logga in</button>
-      <p class="small" style="margin-top:16px"><button type="button" class="btn" id="forgot">Glömt lösenordet?</button></p>
+      <div class="field"><label for="lp">Lösenord</label><input id="lp" type="password" ${signup ? `minlength="6" autocomplete="new-password"` : `autocomplete="current-password"`} required>${signup ? `<span class="hint">Minst 6 tecken.</span>` : ""}</div>
+      <button class="btn primary wide" type="submit">${signup ? "Skapa konto" : "Logga in"}</button>
+      <p class="small switch">${signup ? "Har du redan ett konto?" : "Ny här?"} <button type="button" class="linkbtn" id="mode">${signup ? "Logga in" : "Skapa konto"}</button></p>
+      ${signup ? "" : `<p class="small"><button type="button" class="linkbtn" id="forgot">Glömt lösenordet?</button></p>`}
     </form>`);
     const err = t => { const p = $(".err", box); p.hidden = !t; p.textContent = t || ""; };
+    $("#mode", box).onclick = () => showLogin("", signup ? "login" : "signup");
     box.onsubmit = async e => {
       e.preventDefault(); err("");
-      const btn = $("button[type=submit]", box); btn.disabled = true; btn.textContent = "Loggar in…";
-      const { data, error } = await store.sb.auth.signInWithPassword({ email: $("#le", box).value.trim(), password: $("#lp", box).value });
-      btn.disabled = false; btn.textContent = "Logga in";
+      const btn = $("button[type=submit]", box), label = btn.textContent;
+      btn.disabled = true; btn.textContent = signup ? "Skapar konto…" : "Loggar in…";
+      const email = $("#le", box).value.trim(), password = $("#lp", box).value;
+      let res;
+      if (signup) {
+        res = await store.sb.auth.signUp({ email, password, options: { data: { name: $("#ln", box).value.trim() }, emailRedirectTo: location.origin + location.pathname } });
+      } else {
+        res = await store.sb.auth.signInWithPassword({ email, password });
+      }
+      btn.disabled = false; btn.textContent = label;
+      const { data, error } = res;
       if (error) {
-        err(isNetworkError(error) ? "Ingen internetanslutning. Försök igen när du är online." : "Fel e-post eller lösenord.");
+        const t = errText(error);
+        if (isNetworkError(error)) err("Ingen internetanslutning. Försök igen när du är online.");
+        else if (/already registered|already exists/i.test(t)) err("Det finns redan ett konto med den e-posten. Logga in i stället.");
+        else if (/signups not allowed|signup.*disabled/i.test(t)) err("Det går inte att skapa nya konton just nu. Registrering är avstängd i Supabase.");
+        else if (/email not confirmed/i.test(t)) err("Bekräfta din e-post först. Kolla inkorgen efter ett mejl från Supabase.");
+        else if (/password/i.test(t) && signup) err("Lösenordet måste vara minst 6 tecken.");
+        else if (/rate limit/i.test(t)) err("För många försök. Vänta en stund och försök igen.");
+        else err(signup ? "Kontot kunde inte skapas: " + t : "Fel e-post eller lösenord.");
+        return;
+      }
+      if (signup && !data.session) {
+        showLogin("", "login");
+        const p = $(".login .err"); p.hidden = false; p.className = "ok";
+        p.textContent = `Nästan klart! Vi har skickat ett mejl till ${email}. Klicka på länken i mejlet och logga sedan in här.`;
         return;
       }
       afterLogin(data.session);
     };
-    $("#forgot", box).onclick = async () => {
+    const fg = $("#forgot", box);
+    if (fg) fg.onclick = async () => {
       const email = $("#le", box).value.trim();
       if (!email) { err("Skriv din e-post först, så skickar vi en länk."); $("#le", box).focus(); return; }
       const { error } = await store.sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
       err(""); toast(error ? "Kunde inte skicka. Försök igen om en stund." : "Kolla din e-post efter en länk.");
     };
-    main.replaceChildren(box);
+    $("#main").replaceChildren(box);
   }
 
+  let loggingIn = false;
   async function afterLogin(session) {
-    store.user = session.user; store.me = session.user.id;
-    document.body.classList.remove("locked");
-    store.loadCache();
-    state.loaded = Object.keys(store.recipes).length > 0;
-    render();
-    store.subscribe();
-    await store.refresh();
+    if (loggingIn || (store.user && store.user.id === session.user.id && store.family)) return;
+    loggingIn = true;
+    try {
+      store.user = session.user; store.me = session.user.id;
+      setSync("Ansluter…");
+      const status = await store.loadFamilies();
+      if (status === "schema") {
+        document.body.classList.add("locked");
+        $("#main").replaceChildren(h(`<div class="login"><h2>Databasen behöver uppdateras</h2>
+          <p>Den här versionen av appen har stöd för familjer. Kör filen <b>supabase-setup.sql</b> en gång till i Supabase (SQL Editor → New query → klistra in → Run) och öppna sedan appen igen.</p></div>`));
+        return;
+      }
+      const join = lsGet(K_JOIN, "");
+      if (!store.families.length) {
+        if (status !== "ok") { showLogin("Kunde inte nå databasen. Kontrollera internetanslutningen och försök igen."); store.user = null; return; }
+        showOnboarding();
+        if (join) openJoinPrompt(join);
+        return;
+      }
+      chooseFamily();
+      if (join) setTimeout(() => openJoinPrompt(join), 400);
+    } finally { loggingIn = false; }
   }
 
   // ---------- start ----------
   async function start() {
+    const joinCode = new URLSearchParams(location.search).get("join");
+    if (joinCode) {
+      lsSet(K_JOIN, joinCode.trim().toUpperCase());
+      history.replaceState(null, "", location.pathname + location.hash);
+    }
     if (!CLOUD) {
+      store.family = null;
       if (!store.loadCache()) {
         (window.MIDDAG_SEED || []).forEach(({ id, ...r }) => store.recipes[id] = r);
         store.saveCache();
@@ -947,8 +1307,9 @@
     store.sb = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseKey, {
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
     });
-    store.sb.auth.onAuthStateChange((event) => {
+    store.sb.auth.onAuthStateChange((event, session) => {
       if (event === "PASSWORD_RECOVERY") setTimeout(() => openNewPassword(true), 300);
+      if (event === "SIGNED_IN" && session && !store.user) afterLogin(session);
     });
     setSync("Ansluter…");
     const { data } = await store.sb.auth.getSession();
@@ -958,12 +1319,12 @@
     window.addEventListener("online", () => store.refresh());
     window.addEventListener("offline", () => setSync("Offline", "warn"));
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible" && store.user) { store.subscribe(); store.refresh(); }
+      if (document.visibilityState === "visible" && store.user && store.family) { store.subscribe(); store.refresh(); }
     });
   }
 
   // Exponeras för tester
-  window.__middag = { parseRecipeText, mondayFromKey, keyFor };
+  window.__middag = { parseRecipeText, mondayFromKey, keyFor, store };
 
   start();
 })();

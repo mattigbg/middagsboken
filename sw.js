@@ -1,6 +1,6 @@
 // Gör att appen startar även utan internet.
 // Öka versionen när appens filer ändras, så hämtar telefonerna den nya versionen.
-const VERSION = "middagsboken-v2";
+const VERSION = "middagsboken-v3";
 const IMAGES = "middagsboken-bilder";
 const SHELL = [
   "./",

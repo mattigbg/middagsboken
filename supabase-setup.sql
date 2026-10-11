@@ -38,7 +38,10 @@ do $$ begin
   alter publication supabase_realtime add table public.weeks;
 exception when duplicate_object then null; end $$;
 
--- 4. Startrecept (hoppar över de som redan finns)
+-- 4. Startrecept (bara första gången, innan familjer fanns)
+do $seed$ begin
+  if not exists (select 1 from information_schema.columns
+                 where table_schema = 'public' and table_name = 'recipes' and column_name = 'family_id') then
 insert into public.recipes (id, name, time, servings, tags, ingredients, steps) values
   ($q$kottbullar$q$, $q$Köttbullar med potatismos$q$, $q$45$q$, 4, $q$["Kött","Klassiker"]$q$::jsonb, $q$["500 g blandfärs","1 gul lök","1 ägg","0,5 dl ströbröd","1 dl mjölk","1 kg potatis","2 dl mjölk","30 g smör","2 dl grädde","1 msk soja","1 burk lingonsylt","Salt och peppar"]$q$::jsonb, $q$["Blanda ströbröd och 1 dl mjölk, låt svälla 5 minuter.","Riv eller finhacka löken. Blanda färs, lök, ägg och ströbrödsblandningen. Salta och peppra.","Rulla bullar och stek dem gyllene i smör, ca 8 minuter.","Koka potatisen mjuk, häll av och mosa med varm mjölk och smör.","Häll grädde och soja i stekpannan, låt puttra till en sås.","Servera med mos, sås och lingonsylt."]$q$::jsonb),
   ($q$laxugn$q$, $q$Ugnsbakad lax med citron och dill$q$, $q$30$q$, 4, $q$["Fisk","Snabbt"]$q$::jsonb, $q$["600 g laxfilé","1 citron","1 knippe dill","800 g potatis","2 dl crème fraiche","Salt och peppar"]$q$::jsonb, $q$["Sätt ugnen på 200 grader. Koka potatisen.","Lägg laxen i en form, salta, peppra och lägg på citronskivor.","Baka i ugnen ca 15–18 minuter.","Rör ner hackad dill i crème fraiche.","Servera laxen med potatis och dillsås."]$q$::jsonb),
@@ -49,6 +52,8 @@ insert into public.recipes (id, name, time, servings, tags, ingredients, steps) 
   ($q$linssoppa$q$, $q$Röd linssoppa$q$, $q$30$q$, 4, $q$["Vegetariskt","Soppa"]$q$::jsonb, $q$["3 dl röda linser","1 gul lök","2 klyftor vitlök","2 morötter","1 burk krossade tomater","1 l grönsaksbuljong","1 tsk spiskummin","2 dl kokosmjölk","Salt och peppar"]$q$::jsonb, $q$["Fräs hackad lök, vitlök och morot i en kastrull.","Tillsätt linser, tomater, buljong och spiskummin.","Koka ca 15 minuter tills linserna är mjuka.","Rör ner kokosmjölken och mixa soppan slät. Smaka av."]$q$::jsonb),
   ($q$fiskgratang$q$, $q$Fiskgratäng med räkor$q$, $q$40$q$, 4, $q$["Fisk"]$q$::jsonb, $q$["600 g torskfilé","150 g räkor","3 dl matlagningsgrädde","1 dl riven ost","1 citron","1 knippe dill","1 kg potatis","Salt och peppar"]$q$::jsonb, $q$["Sätt ugnen på 200 grader. Koka potatisen.","Lägg fisken i en ugnsform och salta och peppra.","Strö över räkor och hackad dill. Häll över grädden och riv lite citronskal.","Toppa med ost och gratinera ca 20 minuter.","Servera med potatis."]$q$::jsonb)
 on conflict (id) do nothing;
+  end if;
+end $seed$;
 
 -- =====================================================================
 -- Version 2: bilder, källa, betyg. Ofarligt att köra flera gånger.
@@ -102,4 +107,191 @@ create policy "Inloggade tar bort bilder" on storage.objects
   for delete to authenticated using (bucket_id = 'bilder');
 
 -- Uppdatera appens cache av databasens struktur
+notify pgrst, 'reload schema';
+
+-- =====================================================================
+-- Version 3: familjer. Varje familj har egna recept, menyer och betyg.
+-- Ofarligt att köra flera gånger.
+-- =====================================================================
+
+-- 8. Familjer och medlemmar
+create table if not exists public.families (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null,
+  invite_code text unique not null,
+  created_by  uuid references auth.users(id) on delete set null,
+  created_at  timestamptz default now()
+);
+
+create table if not exists public.family_members (
+  family_id    uuid not null references public.families(id) on delete cascade,
+  user_id      uuid not null references auth.users(id) on delete cascade,
+  role         text not null default 'member' check (role in ('owner', 'member')),
+  display_name text not null default '',
+  joined_at    timestamptz default now(),
+  primary key (family_id, user_id)
+);
+
+alter table public.families       enable row level security;
+alter table public.family_members enable row level security;
+
+-- Hjälpfunktioner för reglerna
+create or replace function public.is_member(fid uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from family_members where family_id = fid and user_id = auth.uid());
+$$;
+
+create or replace function public.is_owner(fid uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from family_members where family_id = fid and user_id = auth.uid() and role = 'owner');
+$$;
+
+create or replace function public.new_code() returns text
+language plpgsql volatile set search_path = public as $$
+declare c text;
+begin
+  loop
+    c := upper(substr(translate(md5(random()::text || clock_timestamp()::text), '01', ''), 1, 6));
+    exit when length(c) = 6 and not exists (select 1 from families where invite_code = c);
+  end loop;
+  return c;
+end $$;
+
+-- 9. Flytta befintliga recept och menyer till en första familj
+alter table public.recipes add column if not exists family_id uuid references public.families(id) on delete cascade;
+alter table public.weeks   add column if not exists family_id uuid references public.families(id) on delete cascade;
+
+do $$
+declare fid uuid;
+begin
+  if exists (select 1 from public.recipes where family_id is null)
+     or exists (select 1 from public.weeks where family_id is null) then
+    insert into public.families (name, invite_code) values ('Min familj', public.new_code()) returning id into fid;
+    insert into public.family_members (family_id, user_id, role, display_name)
+      select fid, u.id,
+             case when row_number() over (order by u.created_at) = 1 then 'owner' else 'member' end,
+             coalesce(nullif(u.raw_user_meta_data->>'name', ''), split_part(u.email, '@', 1))
+      from auth.users u
+      on conflict do nothing;
+    update public.recipes set family_id = fid where family_id is null;
+    update public.weeks   set family_id = fid where family_id is null;
+  end if;
+end $$;
+
+alter table public.recipes alter column family_id set not null;
+alter table public.weeks   alter column family_id set not null;
+
+-- Samma veckonummer kan nu finnas i flera familjer
+alter table public.weeks drop constraint if exists weeks_pkey;
+alter table public.weeks add primary key (family_id, id);
+
+create index if not exists recipes_family_idx on public.recipes (family_id);
+
+-- 10. Regler: man ser och ändrar bara sin egen familjs saker
+drop policy if exists "Inloggade får allt" on public.recipes;
+drop policy if exists "Familjen får allt" on public.recipes;
+create policy "Familjen får allt" on public.recipes
+  for all to authenticated using (public.is_member(family_id)) with check (public.is_member(family_id));
+
+drop policy if exists "Inloggade får allt" on public.weeks;
+drop policy if exists "Familjen får allt" on public.weeks;
+create policy "Familjen får allt" on public.weeks
+  for all to authenticated using (public.is_member(family_id)) with check (public.is_member(family_id));
+
+drop policy if exists "Inloggade ser alla betyg" on public.ratings;
+drop policy if exists "Familjen ser betyg" on public.ratings;
+create policy "Familjen ser betyg" on public.ratings
+  for select to authenticated
+  using (exists (select 1 from public.recipes r where r.id = recipe_id and public.is_member(r.family_id)));
+
+drop policy if exists "Man sätter sina egna betyg" on public.ratings;
+create policy "Man sätter sina egna betyg" on public.ratings
+  for all to authenticated
+  using (user_id = auth.uid())
+  with check (user_id = auth.uid() and exists (select 1 from public.recipes r where r.id = recipe_id and public.is_member(r.family_id)));
+
+drop policy if exists "Medlemmar ser familjen" on public.families;
+create policy "Medlemmar ser familjen" on public.families
+  for select to authenticated using (public.is_member(id));
+
+drop policy if exists "Ägare ändrar familjen" on public.families;
+create policy "Ägare ändrar familjen" on public.families
+  for update to authenticated using (public.is_owner(id)) with check (public.is_owner(id));
+
+drop policy if exists "Ägare tar bort familjen" on public.families;
+create policy "Ägare tar bort familjen" on public.families
+  for delete to authenticated using (public.is_owner(id));
+
+drop policy if exists "Medlemmar ser varandra" on public.family_members;
+create policy "Medlemmar ser varandra" on public.family_members
+  for select to authenticated using (public.is_member(family_id));
+
+drop policy if exists "Lämna eller ta bort medlem" on public.family_members;
+create policy "Lämna eller ta bort medlem" on public.family_members
+  for delete to authenticated using (user_id = auth.uid() or public.is_owner(family_id));
+
+-- 11. Funktioner som appen anropar
+create or replace function public.create_family(p_name text, p_display text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare fid uuid;
+begin
+  if auth.uid() is null then raise exception 'Inte inloggad'; end if;
+  insert into families (name, invite_code, created_by)
+    values (coalesce(nullif(trim(p_name), ''), 'Min familj'), new_code(), auth.uid())
+    returning id into fid;
+  insert into family_members (family_id, user_id, role, display_name)
+    values (fid, auth.uid(), 'owner', coalesce(trim(p_display), ''));
+  return fid;
+end $$;
+
+create or replace function public.family_name_by_code(p_code text)
+returns text language sql stable security definer set search_path = public as $$
+  select name from families where invite_code = upper(trim(p_code));
+$$;
+
+create or replace function public.join_family(p_code text, p_display text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare fid uuid;
+begin
+  if auth.uid() is null then raise exception 'Inte inloggad'; end if;
+  select id into fid from families where invite_code = upper(trim(p_code));
+  if fid is null then raise exception 'Okänd kod'; end if;
+  insert into family_members (family_id, user_id, role, display_name)
+    values (fid, auth.uid(), 'member', coalesce(trim(p_display), ''))
+    on conflict (family_id, user_id) do nothing;
+  return fid;
+end $$;
+
+create or replace function public.new_invite_code(fid uuid)
+returns text language plpgsql security definer set search_path = public as $$
+declare c text;
+begin
+  if not is_owner(fid) then raise exception 'Bara ägaren kan byta kod'; end if;
+  c := new_code();
+  update families set invite_code = c where id = fid;
+  return c;
+end $$;
+
+create or replace function public.set_display_name(p_name text)
+returns void language sql security definer set search_path = public as $$
+  update family_members set display_name = trim(p_name) where user_id = auth.uid();
+$$;
+
+create or replace function public.set_member_role(fid uuid, uid uuid, p_role text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_owner(fid) then raise exception 'Bara ägaren kan ändra roller'; end if;
+  if p_role not in ('owner', 'member') then raise exception 'Okänd roll'; end if;
+  update family_members set role = p_role where family_id = fid and user_id = uid;
+end $$;
+
+revoke execute on function public.new_code() from public, anon, authenticated;
+grant execute on function public.create_family(text, text), public.family_name_by_code(text),
+  public.join_family(text, text), public.new_invite_code(uuid), public.set_display_name(text),
+  public.set_member_role(uuid, uuid, text), public.is_member(uuid), public.is_owner(uuid) to authenticated;
+
+do $$ begin
+  alter publication supabase_realtime add table public.family_members;
+exception when duplicate_object then null; end $$;
+
 notify pgrst, 'reload schema';

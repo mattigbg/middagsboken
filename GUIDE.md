@@ -66,3 +66,22 @@ Gör samma sak på varje familjemedlems telefon.
 - **Byta lösenord:** Tryck på statusknappen uppe till höger och välj "Byt lösenord".
 - **Lägga till fler i familjen:** Använd Supabase, Authentication och Users som i del 1 steg 4.
 - **Kostnad:** 0 kr. Supabase pausar gratisprojekt som inte har använts på 7 dagar. Ni öppnar det igen med ett klick på supabase.com, och ingen data försvinner.
+
+---
+
+## Familjer (från version 3)
+
+Varje person har ett eget konto och kan vara med i en eller flera familjer. Varje familj har egna recept, en egen veckomeny och egna betyg.
+
+**Inställningar i Supabase (görs en gång):**
+1. Gå till **Authentication → Sign In / Providers** och slå **på** *Allow new users to sign up*. Då kan de du bjuder in skapa egna konton.
+2. Under **Email** på samma sida stänger du **av** *Confirm email*. Då kommer man in direkt utan att behöva bekräfta via mejl. Supabase gratismejl kan bara skicka ett par mejl i timmen.
+
+**Bjuda in någon:**
+1. Tryck på familjens namn högst upp i appen.
+2. Tryck **Dela inbjudan** och skicka länken med SMS, Messenger eller något annat.
+3. Personen öppnar länken, skapar ett konto och trycker **Gå med**.
+
+Det går också att ge dem den sexsiffriga **koden**, som de skriver in under "Gå med i en familj".
+
+**Flera familjer:** Tryck på familjens namn och välj **Skapa eller gå med i en annan familj**. Du byter familj i samma meny. Recept kan kopieras mellan familjer med **Kopiera till annan familj**.
