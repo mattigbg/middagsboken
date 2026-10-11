@@ -1,6 +1,7 @@
 // Gör att appen startar även utan internet.
 // Öka versionen när appens filer ändras, så hämtar telefonerna den nya versionen.
-const VERSION = "middagsboken-v1";
+const VERSION = "middagsboken-v2";
+const IMAGES = "middagsboken-bilder";
 const SHELL = [
   "./",
   "index.html",
@@ -23,7 +24,7 @@ self.addEventListener("install", e => {
 self.addEventListener("activate", e => {
   e.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k !== VERSION).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => k !== VERSION && k !== IMAGES).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -32,6 +33,16 @@ self.addEventListener("fetch", e => {
   const req = e.request;
   if (req.method !== "GET") return;
   const url = new URL(req.url);
+
+  // Bilder (egna och från importerade recept): spara en kopia så de syns utan internet.
+  if (req.destination === "image" && url.origin !== location.origin) {
+    e.respondWith(caches.open(IMAGES).then(async c => {
+      const hit = await c.match(req);
+      if (hit) return hit;
+      try { const res = await fetch(req); if (res.ok || res.type === "opaque") c.put(req, res.clone()); return res; } catch { return Response.error(); }
+    }));
+    return;
+  }
 
   // Databasen ska alltid gå direkt till nätet.
   if (url.hostname.endsWith("supabase.co") || url.hostname.endsWith("supabase.in")) return;

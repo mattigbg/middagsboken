@@ -49,3 +49,57 @@ insert into public.recipes (id, name, time, servings, tags, ingredients, steps) 
   ($q$linssoppa$q$, $q$Röd linssoppa$q$, $q$30$q$, 4, $q$["Vegetariskt","Soppa"]$q$::jsonb, $q$["3 dl röda linser","1 gul lök","2 klyftor vitlök","2 morötter","1 burk krossade tomater","1 l grönsaksbuljong","1 tsk spiskummin","2 dl kokosmjölk","Salt och peppar"]$q$::jsonb, $q$["Fräs hackad lök, vitlök och morot i en kastrull.","Tillsätt linser, tomater, buljong och spiskummin.","Koka ca 15 minuter tills linserna är mjuka.","Rör ner kokosmjölken och mixa soppan slät. Smaka av."]$q$::jsonb),
   ($q$fiskgratang$q$, $q$Fiskgratäng med räkor$q$, $q$40$q$, 4, $q$["Fisk"]$q$::jsonb, $q$["600 g torskfilé","150 g räkor","3 dl matlagningsgrädde","1 dl riven ost","1 citron","1 knippe dill","1 kg potatis","Salt och peppar"]$q$::jsonb, $q$["Sätt ugnen på 200 grader. Koka potatisen.","Lägg fisken i en ugnsform och salta och peppra.","Strö över räkor och hackad dill. Häll över grädden och riv lite citronskal.","Toppa med ost och gratinera ca 20 minuter.","Servera med potatis."]$q$::jsonb)
 on conflict (id) do nothing;
+
+-- =====================================================================
+-- Version 2: bilder, källa, betyg. Ofarligt att köra flera gånger.
+-- =====================================================================
+
+-- 5. Bild och källa på recept
+alter table public.recipes add column if not exists image  text default '';
+alter table public.recipes add column if not exists source text default '';
+
+-- 6. Betyg: varje person sätter 1–5 stjärnor per recept
+create table if not exists public.ratings (
+  recipe_id  text not null references public.recipes(id) on delete cascade,
+  user_id    uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  stars      integer not null check (stars between 1 and 5),
+  updated_at timestamptz default now(),
+  primary key (recipe_id, user_id)
+);
+alter table public.ratings enable row level security;
+
+drop policy if exists "Inloggade ser alla betyg" on public.ratings;
+create policy "Inloggade ser alla betyg" on public.ratings
+  for select to authenticated using (true);
+
+drop policy if exists "Man sätter sina egna betyg" on public.ratings;
+create policy "Man sätter sina egna betyg" on public.ratings
+  for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+do $$ begin
+  alter publication supabase_realtime add table public.ratings;
+exception when duplicate_object then null; end $$;
+
+-- 7. Bildlagring (mappen "bilder")
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('bilder', 'bilder', true, 5242880, array['image/jpeg', 'image/png', 'image/webp'])
+on conflict (id) do nothing;
+
+drop policy if exists "Inloggade ser bilder" on storage.objects;
+create policy "Inloggade ser bilder" on storage.objects
+  for select to authenticated using (bucket_id = 'bilder');
+
+drop policy if exists "Inloggade laddar upp bilder" on storage.objects;
+create policy "Inloggade laddar upp bilder" on storage.objects
+  for insert to authenticated with check (bucket_id = 'bilder');
+
+drop policy if exists "Inloggade ändrar bilder" on storage.objects;
+create policy "Inloggade ändrar bilder" on storage.objects
+  for update to authenticated using (bucket_id = 'bilder');
+
+drop policy if exists "Inloggade tar bort bilder" on storage.objects;
+create policy "Inloggade tar bort bilder" on storage.objects
+  for delete to authenticated using (bucket_id = 'bilder');
+
+-- Uppdatera appens cache av databasens struktur
+notify pgrst, 'reload schema';

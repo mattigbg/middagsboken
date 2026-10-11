@@ -119,7 +119,12 @@ main { padding-block: 18px calc(var(--tabbar-h) + 40px + env(safe-area-inset-bot
   padding: 10px 12px; width: 100%;
 }
 .dish.filled { border: 1px solid var(--line); background: var(--surface); }
+.dish { display: flex; align-items: center; gap: 12px; }
+.dish .txt { min-width: 0; flex: 1; }
+.dish .thumb { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; flex: none; background: var(--soft); }
 .dish .name { font-weight: 700; display: block; overflow-wrap: anywhere; }
+.dish .mine { color: var(--lingon); letter-spacing: 1px; }
+.dish .ask { color: var(--accent); font-weight: 600; }
 .dish .meta { font-size: .85rem; color: var(--muted); }
 .dish.empty { color: var(--muted); }
 .servings { display: flex; align-items: center; gap: 6px; }
@@ -136,8 +141,10 @@ main { padding-block: 18px calc(var(--tabbar-h) + 40px + env(safe-area-inset-bot
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
 .card {
   text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
-  padding: 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0;
+  padding: 0; display: flex; flex-direction: column; min-width: 0; overflow: hidden;
 }
+.card .body { padding: 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.card .cover { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block; background: var(--soft); }
 .card h3 { font-size: 1.1rem; overflow-wrap: anywhere; }
 .card .tags { display: flex; flex-wrap: wrap; gap: 4px; }
 .empty-state { border: 1px dashed var(--line); border-radius: var(--r); padding: 28px 20px; text-align: center; color: var(--muted); }
@@ -216,3 +223,34 @@ body.locked .tabbar, body.locked .sync { display: none; }
   .sheet { animation: up .2s ease-out; }
   @keyframes up { from { transform: translateY(30px); opacity: .6; } }
 }
+
+/* Version 2: bilder, betyg, historik, import */
+.hint-card.warn { border-color: var(--lingon); }
+.sortrow { margin: -4px 0 12px; }
+.sortrow select { margin-left: 6px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.picklist button { display: flex; align-items: center; gap: 10px; }
+.picklist .sub { display: block; }
+.pthumb { width: 44px; height: 44px; border-radius: 7px; object-fit: cover; flex: none; background: var(--soft); }
+.hero { width: calc(100% + 32px); max-width: none; margin: -20px -16px 16px; aspect-ratio: 16 / 10; object-fit: cover; display: block; border-radius: 16px 16px 0 0; background: var(--soft); }
+@media (min-width: 720px) { .hero { width: calc(100% + 48px); margin: -24px -24px 18px; } }
+.sheet .hero + h2 { margin-top: 0; }
+.sheet:has(.hero) > div > .close { position: relative; z-index: 2; background: var(--surface); }
+.rate { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+.stars { display: inline-flex; gap: 2px; }
+.stars button { border: 0; background: none; font-size: 1.9rem; line-height: 1; padding: 2px 3px; color: var(--line); }
+.stars button.on { color: var(--lingon); }
+.imgpick { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.imgpick .preview { width: 120px; height: 90px; border-radius: 10px; background: var(--soft); display: flex; align-items: center; justify-content: center; overflow: hidden; text-align: center; }
+.imgpick .preview img { width: 100%; height: 100%; object-fit: cover; }
+.flabel { font-weight: 600; font-size: .92rem; }
+.err { color: var(--lingon); font-weight: 600; }
+.mini { list-style: none; margin: 8px 0 0; padding: 0; }
+.mini li { display: flex; gap: 12px; padding-block: 6px; border-bottom: 1px solid var(--line); }
+.mini li.link { cursor: pointer; }
+.mini li.link .n { color: var(--accent); }
+.mini .d { width: 2.6em; flex: none; color: var(--muted); font-size: .9rem; padding-top: 1px; }
+.mini .n { min-width: 0; overflow-wrap: anywhere; }
+.lastyear { padding-top: 18px; border-top: 1px solid var(--line); }
+.hweek { margin-top: 18px; }
+details summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+.btn.small { padding: 6px 12px; font-size: .85rem; }
