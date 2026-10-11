@@ -1,0 +1,27 @@
+// Startrecept. Används i testläget och för att fylla databasen första gången (supabase-setup.sql).
+window.MIDDAG_SEED = [
+  { id: "kottbullar", name: "Köttbullar med potatismos", time: "45", servings: 4, tags: ["Kött", "Klassiker"],
+    ingredients: ["500 g blandfärs", "1 gul lök", "1 ägg", "0,5 dl ströbröd", "1 dl mjölk", "1 kg potatis", "2 dl mjölk", "30 g smör", "2 dl grädde", "1 msk soja", "1 burk lingonsylt", "Salt och peppar"],
+    steps: ["Blanda ströbröd och 1 dl mjölk, låt svälla 5 minuter.", "Riv eller finhacka löken. Blanda färs, lök, ägg och ströbrödsblandningen. Salta och peppra.", "Rulla bullar och stek dem gyllene i smör, ca 8 minuter.", "Koka potatisen mjuk, häll av och mosa med varm mjölk och smör.", "Häll grädde och soja i stekpannan, låt puttra till en sås.", "Servera med mos, sås och lingonsylt."] },
+  { id: "laxugn", name: "Ugnsbakad lax med citron och dill", time: "30", servings: 4, tags: ["Fisk", "Snabbt"],
+    ingredients: ["600 g laxfilé", "1 citron", "1 knippe dill", "800 g potatis", "2 dl crème fraiche", "Salt och peppar"],
+    steps: ["Sätt ugnen på 200 grader. Koka potatisen.", "Lägg laxen i en form, salta, peppra och lägg på citronskivor.", "Baka i ugnen ca 15–18 minuter.", "Rör ner hackad dill i crème fraiche.", "Servera laxen med potatis och dillsås."] },
+  { id: "pyttipanna", name: "Pytt i panna", time: "30", servings: 4, tags: ["Kött", "Snabbt", "Klassiker"],
+    ingredients: ["800 g kokt potatis", "400 g kokt skinka eller korv", "1 gul lök", "4 ägg", "1 burk inlagda rödbetor", "30 g smör", "Salt och peppar"],
+    steps: ["Tärna potatis, kött och lök.", "Stek löken mjuk i smör, tillsätt potatis och stek tills den får färg.", "Lägg i köttet och stek några minuter till. Smaka av med salt och peppar.", "Stek äggen och servera ovanpå med rödbetor."] },
+  { id: "kycklinggryta", name: "Krämig kycklinggryta med ris", time: "35", servings: 4, tags: ["Kyckling", "Barnvänligt"],
+    ingredients: ["600 g kycklingfilé", "1 gul lök", "2 klyftor vitlök", "1 röd paprika", "3 dl matlagningsgrädde", "2 msk tomatpuré", "1 tsk paprikapulver", "3 dl ris", "Salt och peppar"],
+    steps: ["Koka riset enligt förpackningen.", "Skär kycklingen i bitar och bryn den i en stor panna.", "Lägg i hackad lök, vitlök och paprika och fräs ett par minuter.", "Rör ner tomatpuré, paprikapulver och grädde. Låt puttra 10 minuter.", "Smaka av och servera med riset."] },
+  { id: "pastapesto", name: "Pasta med pesto och ugnsrostade tomater", time: "20", servings: 4, tags: ["Vegetariskt", "Snabbt"],
+    ingredients: ["400 g pasta", "1 burk grön pesto", "250 g körsbärstomater", "1 påse ruccola", "50 g parmesan", "2 msk olivolja", "Salt"],
+    steps: ["Sätt ugnen på 225 grader. Rosta tomaterna med olivolja och salt i 12 minuter.", "Koka pastan.", "Blanda pastan med pesto.", "Toppa med tomater, ruccola och riven parmesan."] },
+  { id: "tacos", name: "Fredagstacos", time: "30", servings: 4, tags: ["Kött", "Barnvänligt", "Fredag"],
+    ingredients: ["500 g nötfärs", "1 påse tacokrydda", "8 st tortillabröd", "1 isbergssallad", "2 tomater", "1 gurka", "1 burk majs", "2 dl riven ost", "1 burk tacosås", "2 dl gräddfil"],
+    steps: ["Bryn färsen och tillsätt tacokrydda och vatten enligt påsen.", "Skär grönsakerna i små bitar.", "Värm tortillabröden.", "Ställ fram allt och låt alla bygga sina egna tacos."] },
+  { id: "linssoppa", name: "Röd linssoppa", time: "30", servings: 4, tags: ["Vegetariskt", "Soppa"],
+    ingredients: ["3 dl röda linser", "1 gul lök", "2 klyftor vitlök", "2 morötter", "1 burk krossade tomater", "1 l grönsaksbuljong", "1 tsk spiskummin", "2 dl kokosmjölk", "Salt och peppar"],
+    steps: ["Fräs hackad lök, vitlök och morot i en kastrull.", "Tillsätt linser, tomater, buljong och spiskummin.", "Koka ca 15 minuter tills linserna är mjuka.", "Rör ner kokosmjölken och mixa soppan slät. Smaka av."] },
+  { id: "fiskgratang", name: "Fiskgratäng med räkor", time: "40", servings: 4, tags: ["Fisk"],
+    ingredients: ["600 g torskfilé", "150 g räkor", "3 dl matlagningsgrädde", "1 dl riven ost", "1 citron", "1 knippe dill", "1 kg potatis", "Salt och peppar"],
+    steps: ["Sätt ugnen på 200 grader. Koka potatisen.", "Lägg fisken i en ugnsform och salta och peppra.", "Strö över räkor och hackad dill. Häll över grädden och riv lite citronskal.", "Toppa med ost och gratinera ca 20 minuter.", "Servera med potatis."] }
+];
