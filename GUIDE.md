@@ -85,3 +85,32 @@ Varje person har ett eget konto och kan vara med i en eller flera familjer. Varj
 Det går också att ge dem den sexsiffriga **koden**, som de skriver in under "Gå med i en familj".
 
 **Flera familjer:** Tryck på familjens namn och välj **Skapa eller gå med i en annan familj**. Du byter familj i samma meny. Recept kan kopieras mellan familjer med **Kopiera till annan familj**.
+
+---
+
+## Roller (från version 4)
+
+| Roll | Kan |
+|---|---|
+| **Medlem** | Se allt, betygsätta, bocka av och ändra inköpslistan, föreslå middagar och rösta på förslag |
+| **Redigerare** | Allt ovan, plus ändra veckomenyn och recepten |
+| **Ägare** | Allt ovan, plus bjuda in, ändra roller, ta bort medlemmar och skapa länk till väggskärm |
+
+Nya medlemmar börjar som **Medlem**. Ägaren ändrar roll genom att trycka på familjens namn och välja roll i listan vid personen.
+
+## Väggskärm i Home Assistant
+
+1. I appen trycker du på familjens namn, väljer **Skapa länk till väggskärm** och sedan **Kopiera länk**. Bara ägaren ser det här.
+2. I Home Assistant öppnar du dashboarden och väljer **✎ Redigera → + Lägg till kort → Webbsida** (Webpage).
+3. Klistra in länken som **URL** och spara.
+4. Vill du att menyn ska fylla hela skärmen skapar du en ny **vy** av typen **Panel (ett kort)** och lägger webbsidekortet där.
+
+Vill du alltid ha mörkt eller ljust tema lägger du till `&tema=mörk` eller `&tema=ljus` sist i länken.
+Om länken har spridits trycker du **Ny länk**. Då slutar den gamla fungera, och du behöver klistra in den nya i Home Assistant.
+
+## Matlagningsläge, dela och exportera
+
+- **Laga** i ett recept håller skärmen tänd (kräver iOS 18.4 eller senare) och låter dig bocka av ingredienser och steg.
+- **Dela** skickar receptet som text, till exempel via Messenger eller SMS.
+- **Skriv ut** gör en A4-sida. På iPhone kan du spara den som PDF via Dela och sedan Spara i Filer.
+- **Recept → Exportera** sparar en säkerhetskopia av alla recept eller skriver ut en hel receptbok. Säkerhetskopian läser du in igen under **Importera → Från säkerhetskopia**.

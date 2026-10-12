@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "3";
+  const APP_VERSION = "4";
 
   // ---------- hjälpfunktioner ----------
   const DAYS = ["Måndag", "Tisdag", "Onsdag", "Torsdag", "Fredag", "Lördag", "Söndag"];
@@ -50,14 +50,14 @@
   const K_OUTBOX = "mb-outbox", K_FAMILY = "mb-family", K_JOIN = "mb-join";
   const cacheKey = fid => "mb-cache-" + (fid || "local");
   const BUCKET = "bilder";
-  const opKey = op => (op.fid || "") + "/" + ({ r: "r", rd: "r", w: "w", rt: "t" }[op.k]) + ":" + op.id;
+  const opKey = op => (op.fid || "") + "/" + ({ r: "r", rd: "r", w: "w", rt: "t", s: "s" }[op.k]) + ":" + op.id;
 
   const store = {
     sb: null, user: null, me: CLOUD ? null : "me",
     family: null,          // id för vald familj
     families: [],          // [{id, name, invite_code, role}]
     members: {},           // user_id -> {name, role} i vald familj
-    recipes: {}, weeks: {}, ratings: {},
+    recipes: {}, weeks: {}, ratings: {}, shopping: {}, suggestions: [],
     outbox: lsGet(K_OUTBOX, []),
     flushing: false, channel: null, needsDbUpdate: false,
 
@@ -68,7 +68,7 @@
     },
 
     saveCache() {
-      const ok = lsSet(cacheKey(this.family), { recipes: this.recipes, weeks: this.weeks, ratings: this.ratings, members: this.members });
+      const ok = lsSet(cacheKey(this.family), { recipes: this.recipes, weeks: this.weeks, ratings: this.ratings, members: this.members, shopping: this.shopping, suggestions: this.suggestions });
       if (!ok && !CLOUD) toast("Telefonens lagring är full. Ta bort några bilder.");
       if (CLOUD) lsSet("mb-families", this.families);
     },
@@ -76,6 +76,7 @@
       const c = lsGet(cacheKey(this.family), null);
       this.recipes = (c && c.recipes) || {}; this.weeks = (c && c.weeks) || {};
       this.ratings = (c && c.ratings) || {}; this.members = (c && c.members) || {};
+      this.shopping = (c && c.shopping) || {}; this.suggestions = (c && c.suggestions) || [];
       return !!c;
     },
 
@@ -84,6 +85,7 @@
       if (op.k === "r") this.recipes[op.id] = op.data;
       else if (op.k === "rd") { delete this.recipes[op.id]; delete this.ratings[op.id]; }
       else if (op.k === "w") this.weeks[op.id] = op.data;
+      else if (op.k === "s") this.shopping[op.id] = op.data;
       else if (op.k === "rt") {
         const r = { ...(this.ratings[op.id] || {}) };
         if (op.stars) r[this.me] = op.stars; else delete r[this.me];
@@ -119,6 +121,7 @@
           else if (op.k === "r") res = await this.sb.from("recipes").upsert({ id: op.id, family_id: op.fid, ...recipeToRow(op.data), updated_at: now });
           else if (op.k === "rd") res = await this.sb.from("recipes").delete().eq("id", op.id);
           else if (op.k === "w") res = await this.sb.from("weeks").upsert({ family_id: op.fid, id: op.id, data: op.data, updated_at: now }, { onConflict: "family_id,id" });
+          else if (op.k === "s") res = await this.sb.from("shopping").upsert({ family_id: op.fid, week_id: op.id, checked: op.data.checked || [], extras: op.data.extras || [], edits: op.data.edits || {}, updated_at: now }, { onConflict: "family_id,week_id" });
           else if (op.k === "rt") res = op.stars
             ? await this.sb.from("ratings").upsert({ recipe_id: op.id, user_id: this.me, stars: op.stars, updated_at: now })
             : await this.sb.from("ratings").delete().eq("recipe_id", op.id).eq("user_id", this.me);
@@ -127,7 +130,9 @@
             if (isAuthError(res.error)) { await this.sb.auth.refreshSession().catch(() => {}); setSync("Logga in igen", "warn"); return; }
             if (isSchemaError(res.error)) { this.needsDbUpdate = true; setSync("Databasen behöver uppdateras", "warn"); render(); return; }
             console.error(res.error);
-            toast("En ändring kunde inte sparas: " + (res.error.message || "okänt fel"));
+            toast(/row-level security|permission/i.test(errText(res.error))
+              ? "Ändringen sparades inte. Du har inte behörighet att ändra det här."
+              : "En ändring kunde inte sparas: " + (res.error.message || "okänt fel"));
           }
           this.outbox.shift();
           lsSet(K_OUTBOX, this.outbox);
@@ -143,7 +148,7 @@
     // Hämtar vilka familjer man är med i.
     async loadFamilies() {
       const { data, error } = await this.sb.from("family_members")
-        .select("role, families(id, name, invite_code)").eq("user_id", this.me);
+        .select("role, families(id, name, invite_code, display_key)").eq("user_id", this.me);
       if (error) {
         if (isSchemaError(error)) { this.needsDbUpdate = true; return "schema"; }
         this.families = lsGet("mb-families", []);
@@ -158,11 +163,13 @@
     async pull() {
       if (!CLOUD || !this.user || !this.family) return;
       const fid = this.family;
-      const [r, w, t, m] = await Promise.all([
+      const [r, w, t, m, sh, sg] = await Promise.all([
         this.sb.from("recipes").select("*").eq("family_id", fid),
         this.sb.from("weeks").select("*").eq("family_id", fid),
         this.sb.from("ratings").select("recipe_id,user_id,stars"),
-        this.sb.from("family_members").select("user_id,display_name,role").eq("family_id", fid)
+        this.sb.from("family_members").select("user_id,display_name,role").eq("family_id", fid),
+        this.sb.from("shopping").select("week_id,checked,extras,edits").eq("family_id", fid),
+        this.sb.from("suggestions").select("*").eq("family_id", fid).eq("status", "open")
       ]);
       if (fid !== this.family) return; // familjen byttes medan vi hämtade
       if (r.error || w.error) {
@@ -176,6 +183,12 @@
       if (t.error) this.needsDbUpdate = true;
       else (t.data || []).forEach(row => { if (recipes[row.recipe_id]) (ratings[row.recipe_id] = ratings[row.recipe_id] || {})[row.user_id] = row.stars; });
       if (!m.error) { const mem = {}; m.data.forEach(x => mem[x.user_id] = { name: x.display_name, role: x.role }); this.members = mem; }
+      if (sh.error || sg.error) this.needsDbUpdate = true;
+      else {
+        const shopping = {}; sh.data.forEach(x => shopping[x.week_id] = { checked: x.checked || [], extras: x.extras || [], edits: x.edits || {} });
+        this.shopping = shopping;
+        this.suggestions = sg.data;
+      }
       this.recipes = recipes; this.weeks = weeks; this.ratings = ratings;
       this.outbox.forEach(op => this.apply(op)); // ändringar som inte hunnit sparas ligger kvar
       this.saveCache();
@@ -215,7 +228,23 @@
         .on("postgres_changes", { event: "*", schema: "public", table: "family_members", filter }, () => {
           this.refreshMembers();
         })
+        .on("postgres_changes", { event: "*", schema: "public", table: "shopping", filter }, p => {
+          const row = p.new; if (!row || !row.week_id || pending("s:" + row.week_id)) return;
+          this.shopping[row.week_id] = { checked: row.checked || [], extras: row.extras || [], edits: row.edits || {} };
+          this.saveCache(); render();
+        })
+        .on("postgres_changes", { event: "*", schema: "public", table: "suggestions", filter }, () => {
+          this.loadSuggestions();
+        })
         .subscribe();
+    },
+
+    async loadSuggestions() {
+      if (!CLOUD || !this.family) return;
+      const fid = this.family;
+      const { data, error } = await this.sb.from("suggestions").select("*").eq("family_id", fid).eq("status", "open");
+      if (error || fid !== this.family) return;
+      this.suggestions = data; this.saveCache(); render();
     },
 
     async refreshMembers() {
@@ -314,6 +343,15 @@
     return { servings: w.servings || 4, days, checked: w.checked || [], extras: w.extras || [] };
   }
   const putWeek = (w, key = weekKey(monday())) => store.change({ k: "w", id: key, data: w });
+  // Inköpslistan sparas för sig, så att alla i familjen kan bocka av och ändra.
+  function getShop(key = weekKey(monday())) {
+    const sh = store.shopping[key], w = store.weeks[key] || {};
+    return { checked: (sh ? sh.checked : w.checked) || [], extras: (sh ? sh.extras : w.extras) || [], edits: (sh && sh.edits) || {} };
+  }
+  const putShop = (sh, key = weekKey(monday())) => store.change({ k: "s", id: key, data: sh });
+  // Får den inloggade ändra menyer och recept i vald familj?
+  const canEdit = () => !CLOUD || !!(store.current && (store.current.role === "owner" || store.current.role === "editor"));
+  const ROLE_NAMES = { owner: "Ägare", editor: "Redigerare", member: "Medlem" };
 
   // Betyg
   function rating(id) {
@@ -349,6 +387,10 @@
   function render() {
     if (document.body.classList.contains("locked")) return;
     document.querySelectorAll("#tabbar button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.tab === state.tab)));
+    const nsug = CLOUD ? store.suggestions.filter(x => x.status === "open").length : 0, wb = $('#tabbar [data-tab="week"]');
+    let badge = $(".badge", wb);
+    if (nsug && canEdit()) { if (!badge) { badge = h(`<span class="badge"></span>`); wb.append(badge); } badge.textContent = nsug; }
+    else if (badge) badge.remove();
     const main = $("#main");
     const active = document.activeElement && document.activeElement.id;
     const y = window.scrollY;
@@ -418,31 +460,39 @@
   function renderWeek(main) {
     const hint = installHint(); if (hint) main.append(hint);
     main.append(weekNav());
-    const wk = getWeek(), mon = monday(), today = today0();
-    const bar = h(`<div class="row spread" style="margin-bottom:14px">
-      <div class="servings"><label for="serv" class="small muted">Antal personer</label><input id="serv" type="number" inputmode="numeric" min="1" max="20" value="${wk.servings}"></div>
-      <div class="row"><button class="btn primary" id="rnd">Slumpa tomma dagar</button><button class="btn" id="clr">Töm veckan</button></div></div>`);
-    $("#serv", bar).onchange = e => { const v = Math.max(1, Math.min(20, +e.target.value || 4)); putWeek({ ...wk, servings: v }); };
-    $("#rnd", bar).onclick = () => randomize(wk);
-    const clr = $("#clr", bar);
-    clr.onclick = () => {
-      if (!clr.classList.contains("armed")) { clr.classList.add("armed", "danger"); clr.textContent = "Ja, töm"; setTimeout(() => { clr.classList.remove("armed", "danger"); clr.textContent = "Töm veckan"; }, 3000); return; }
-      putWeek({ ...wk, days: wk.days.map(() => ({ recipeId: "", note: "" })), checked: [] }); toast("Veckan är tömd");
-    };
-    main.append(bar);
+    const wk = getWeek(), mon = monday(), today = today0(), edit = canEdit();
+    if (edit) {
+      const bar = h(`<div class="row spread" style="margin-bottom:14px">
+        <div class="servings"><label for="serv" class="small muted">Antal personer</label><input id="serv" type="number" inputmode="numeric" min="1" max="20" value="${wk.servings}"></div>
+        <div class="row"><button class="btn primary" id="rnd">Slumpa tomma dagar</button><button class="btn" id="clr">Töm veckan</button></div></div>`);
+      $("#serv", bar).onchange = e => { const v = Math.max(1, Math.min(20, +e.target.value || 4)); putWeek({ ...wk, servings: v }); };
+      $("#rnd", bar).onclick = () => randomize(wk);
+      const clr = $("#clr", bar);
+      clr.onclick = () => {
+        if (!clr.classList.contains("armed")) { clr.classList.add("armed", "danger"); clr.textContent = "Ja, töm"; setTimeout(() => { clr.classList.remove("armed", "danger"); clr.textContent = "Töm veckan"; }, 3000); return; }
+        putWeek({ ...wk, days: wk.days.map(() => ({ recipeId: "", note: "" })) }); toast("Veckan är tömd");
+      };
+      main.append(bar);
+    } else {
+      const bar = h(`<div class="row spread memberbar"><span class="small muted">Du är Medlem och kan föreslå middagar. Ägaren kan ge dig rätt att ändra menyn.</span><button class="btn primary" id="sug">+ Föreslå</button></div>`);
+      $("#sug", bar).onclick = () => openSuggest({});
+      main.append(bar);
+    }
 
     const ul = h(`<ul class="days"></ul>`);
     wk.days.forEach((d, i) => {
       const date = addDays(mon, i), r = d.recipeId && recipeById(d.recipeId);
       const isToday = +date === +today;
+      const empty = !r && !d.note;
       const li = h(`<li class="day${isToday ? " today" : ""}">
         <div class="when"><b>${DAYS[i]}</b><small>${fmtDate(date)}${isToday ? " · i dag" : ""}</small></div>
-        <button class="dish ${r || d.note ? "filled" : "empty"}${r && r.image ? " has-img" : ""}">${dayInner(d, r, date <= today)}</button></li>`);
-      $(".dish", li).onclick = () => r ? openRecipe(r.id, i) : openPicker(i);
+        <button class="dish ${r || d.note ? "filled" : "empty"}${r && r.image ? " has-img" : ""}">${empty && !edit ? `<span class="txt">+ Föreslå något</span>` : dayInner(d, r, date <= today)}</button></li>`);
+      $(".dish", li).onclick = () => r ? openRecipe(r.id, edit ? i : undefined) : edit ? openPicker(i) : empty ? openSuggest({ day: i }) : null;
       ul.append(li);
     });
     main.append(ul);
-    if (state.loaded && !recipeList().length) main.append(h(`<div class="empty-state" style="margin-top:20px"><p>Du har inga recept än. Lägg till några under Recept, så kan du välja dem här.</p></div>`));
+    if (state.loaded && !recipeList().length) main.append(h(`<div class="empty-state" style="margin-top:20px"><p>${edit ? "Du har inga recept än. Lägg till några under Recept, så kan du välja dem här." : "Familjen har inga recept än."}</p></div>`));
+    if (CLOUD) main.append(suggestionsSection());
     main.append(lastYear(wk));
   }
 
@@ -467,7 +517,7 @@
     });
     sec.append(ul);
     const empty = cur.days.filter(d => !d.recipeId && !d.note).length;
-    if (empty) {
+    if (empty && canEdit()) {
       const b = h(`<button class="btn" style="margin-top:10px">Använd fjolårets meny på tomma dagar</button>`);
       b.onclick = () => {
         let n = 0;
@@ -551,6 +601,12 @@
       });
     };
     $("#pq", box).oninput = fill; fill();
+    const sl = CLOUD ? openSuggestions() : [];
+    if (sl.length) {
+      const sec = h(`<div class="pick-sugg"><div class="label">Förslag från familjen</div><ul class="sugglist"></ul></div>`);
+      sl.forEach(sg => $("ul", sec).append(suggestionItem(sg, x => useSuggestion(x, i))));
+      $("#pq", box).before(sec);
+    }
     const saveNote = () => { const v = $("#pnote", box).value.trim(); setDay(i, { recipeId: "", note: v }); closeSheet(); };
     $("#psave", box).onclick = saveNote;
     $("#pnote", box).onkeydown = e => { if (e.key === "Enter") saveNote(); };
@@ -559,6 +615,133 @@
   }
   function setDay(i, val) {
     const wk = getWeek(); const days = wk.days.slice(); days[i] = val; putWeek({ ...wk, days });
+  }
+
+  // ---------- förslag ----------
+  const openSuggestions = () => store.suggestions.filter(x => x.status === "open")
+    .sort((a, b) => (b.votes || []).length - (a.votes || []).length || String(a.created_at).localeCompare(String(b.created_at)));
+  function suggestionTitle(sg) {
+    const r = sg.recipe_id && recipeById(sg.recipe_id);
+    return r ? r.name : (sg.text || "Förslag");
+  }
+  function suggestionMeta(sg) {
+    const r = sg.recipe_id && recipeById(sg.recipe_id);
+    const who = (store.members[sg.user_id] && store.members[sg.user_id].name) || "Någon";
+    let when = "";
+    if (sg.day != null && sg.week_id) {
+      const mon = mondayFromKey(sg.week_id);
+      when = mon ? ` · ${DAYS[sg.day].toLowerCase()} ${fmtDate(addDays(mon, sg.day))}` : "";
+    }
+    return `${esc(who)}${when}${r && sg.text ? ` · ”${esc(sg.text)}”` : ""}`;
+  }
+  async function voteSuggestion(sg) {
+    const { error } = await store.sb.rpc("toggle_vote", { sid: sg.id });
+    if (error) toast(rpcError(error, "Rösten kunde inte sparas.")); else store.loadSuggestions();
+  }
+  async function setSuggestionStatus(sg, status) {
+    const { error } = await store.sb.from("suggestions").update({ status }).eq("id", sg.id);
+    if (error) { toast(rpcError(error, "Förslaget kunde inte uppdateras.")); return false; }
+    store.suggestions = store.suggestions.filter(x => x.id !== sg.id); store.saveCache(); render();
+    return true;
+  }
+  async function deleteSuggestion(sg) {
+    const { error } = await store.sb.from("suggestions").delete().eq("id", sg.id);
+    if (error) { toast(rpcError(error, "Förslaget kunde inte tas bort.")); return; }
+    store.suggestions = store.suggestions.filter(x => x.id !== sg.id); store.saveCache(); render();
+  }
+  // Lägg in ett förslag på en dag i den vecka som visas.
+  async function useSuggestion(sg, dayIndex) {
+    const r = sg.recipe_id && recipeById(sg.recipe_id);
+    setDay(dayIndex, r ? { recipeId: r.id, note: "" } : { recipeId: "", note: sg.text.slice(0, 60) });
+    await setSuggestionStatus(sg, "done");
+    closeSheet(); toast(`Inlagt på ${DAYS[dayIndex].toLowerCase()}`);
+  }
+  function chooseDayFor(sg) {
+    const wk = getWeek(), cur = weekKey(monday());
+    const pre = sg.day != null && sg.week_id === cur ? sg.day : wk.days.findIndex(d => !d.recipeId && !d.note);
+    const box = h(`<div><h2>Vilken dag?</h2><p class="small muted" style="margin:0 0 6px">${esc(suggestionTitle(sg))}, vecka ${isoWeek(monday()).week}</p><ul class="picklist"></ul></div>`);
+    box.prepend(closeBtn());
+    wk.days.forEach((d, i) => {
+      const r = d.recipeId && recipeById(d.recipeId);
+      const li = h(`<li><button${i === pre ? ' class="pre"' : ""}><span><b>${DAYS[i]} ${fmtDate(addDays(monday(), i))}</b><span class="sub">${r ? "Ersätter " + esc(r.name) : d.note ? "Ersätter " + esc(d.note) : "Ledig"}</span></span></button></li>`);
+      $("button", li).onclick = () => useSuggestion(sg, i);
+      $(".picklist", box).append(li);
+    });
+    openSheet(box);
+  }
+  function suggestionItem(sg, onPick) {
+    const mine = (sg.votes || []).includes(store.me), n = (sg.votes || []).length;
+    const li = h(`<li class="sugg">
+      <div class="st"><b>${esc(suggestionTitle(sg))}</b><span class="small muted">${suggestionMeta(sg)}</span></div>
+      <div class="sa"><button class="vote${mine ? " on" : ""}" aria-pressed="${mine}" aria-label="Tumme upp">👍 ${n || ""}</button></div></li>`);
+    $(".vote", li).onclick = e => { e.stopPropagation(); voteSuggestion(sg); };
+    const sa = $(".sa", li);
+    if (onPick) {
+      const b = h(`<button class="btn small primary">Välj</button>`); b.onclick = () => onPick(sg); sa.append(b);
+    } else if (canEdit()) {
+      const add = h(`<button class="btn small primary">Lägg in</button>`); add.onclick = () => chooseDayFor(sg);
+      const no = h(`<button class="btn small" aria-label="Avfärda förslaget">✕</button>`);
+      no.onclick = () => { if (!no.classList.contains("armed")) { no.classList.add("armed", "danger"); no.textContent = "Avfärda"; return; } setSuggestionStatus(sg, "dismissed"); };
+      sa.append(add, no);
+    } else if (sg.user_id === store.me) {
+      const rm = h(`<button class="btn small">Ta bort</button>`); rm.onclick = () => deleteSuggestion(sg); sa.append(rm);
+    }
+    const r = sg.recipe_id && recipeById(sg.recipe_id);
+    if (r) { $(".st", li).classList.add("link"); $(".st", li).onclick = () => openRecipe(r.id); }
+    return li;
+  }
+  function suggestionsSection() {
+    const list = openSuggestions();
+    const sec = h(`<div class="section suggestions"><div class="row spread"><h3>Förslag från familjen${list.length ? ` (${list.length})` : ""}</h3><button class="btn small" id="sugadd">+ Föreslå</button></div></div>`);
+    $("#sugadd", sec).onclick = () => openSuggest({});
+    if (!list.length) {
+      sec.append(h(`<p class="small muted" style="margin:4px 0 0">Inga förslag just nu. Alla i familjen kan föreslå rätter, och ${canEdit() ? "du lägger in dem på en dag med ett tryck." : "den som planerar ser dem direkt."}</p>`));
+      return sec;
+    }
+    const ul = h(`<ul class="sugglist"></ul>`);
+    list.forEach(sg => ul.append(suggestionItem(sg)));
+    sec.append(ul);
+    return sec;
+  }
+  function openSuggest({ recipeId, day }) {
+    if (!CLOUD) { toast("Förslag fungerar när appen är kopplad till databasen."); return; }
+    let chosen = recipeId || "";
+    const cur = weekKey(monday());
+    const box = h(`<form>
+      <h2>Föreslå en middag</h2>
+      <p class="small muted" style="margin:0 0 10px">Välj ett recept, skriv fritt eller gör båda.</p>
+      <input class="search" id="sq" type="search" placeholder="Sök recept…" style="width:100%">
+      <ul class="picklist short"></ul>
+      <div class="field" style="margin-top:14px"><label for="stext">Fritext eller kommentar</label><input id="stext" maxlength="140" placeholder="T.ex. Något med fisk, eller Mormors lasagne"></div>
+      <div class="field"><label for="sday">När?</label><select id="sday" class="btn"><option value="">Någon dag</option>${DAYS.map((d, i) => `<option value="${i}"${day === i ? " selected" : ""}>${d} ${fmtDate(addDays(monday(), i))} (v${isoWeek(monday()).week})</option>`).join("")}</select></div>
+      <p class="err small" hidden></p>
+      <button class="btn primary" type="submit">Skicka förslag</button></form>`);
+    box.prepend(closeBtn());
+    const list = $(".picklist", box);
+    const fill = () => {
+      const q = $("#sq", box).value.trim().toLowerCase();
+      list.replaceChildren();
+      recipeList().filter(r => !q || r.name.toLowerCase().includes(q) || r.id === chosen)
+        .sort((a, b) => (b.id === chosen) - (a.id === chosen) || rating(b.id).avg - rating(a.id).avg)
+        .slice(0, q ? 30 : 12).forEach(r => {
+          const li = h(`<li><button type="button" class="${r.id === chosen ? "pre" : ""}">${thumb(r, "pthumb")}<span><b>${esc(r.name)}</b>${r.id === chosen ? " ✓" : ""}<span class="sub">${[ratingLabel(r.id), r.time && r.time + " min"].filter(Boolean).map(esc).join(" · ")}</span></span></button></li>`);
+          $("button", li).onclick = () => { chosen = chosen === r.id ? "" : r.id; fill(); };
+          list.append(li);
+        });
+    };
+    $("#sq", box).oninput = fill; fill();
+    box.onsubmit = async e => {
+      e.preventDefault();
+      const text = $("#stext", box).value.trim(), dv = $("#sday", box).value;
+      const err = $(".err", box);
+      if (!chosen && !text) { err.hidden = false; err.textContent = "Välj ett recept eller skriv något."; return; }
+      const btn = $("button[type=submit]", box); btn.disabled = true;
+      const { error } = await store.sb.from("suggestions").insert({ family_id: store.family, user_id: store.me, recipe_id: chosen || null, text, week_id: cur, day: dv === "" ? null : +dv });
+      btn.disabled = false;
+      if (error) { err.hidden = false; err.textContent = rpcError(error, "Förslaget kunde inte skickas."); return; }
+      closeSheet(); toast("Tack för förslaget!"); store.loadSuggestions();
+    };
+    openSheet(box);
   }
 
   // ---------- historik ----------
@@ -593,10 +776,10 @@
   function renderRecipes(main) {
     const top = h(`<div class="tools">
       <input class="search" id="rq" type="search" placeholder="Sök namn, ingrediens eller tagg…" value="${esc(state.q)}">
-      <div class="row"><button class="btn primary" id="newr">+ Nytt recept</button><button class="btn" id="imp">Importera</button></div></div>`);
+      <div class="row">${canEdit() ? `<button class="btn primary" id="newr">+ Nytt recept</button><button class="btn" id="imp">Importera</button>` : ""}<button class="btn" id="exp">Exportera</button></div></div>`);
     main.append(top);
-    $("#newr", top).onclick = () => openEditor();
-    $("#imp", top).onclick = openImport;
+    if (canEdit()) { $("#newr", top).onclick = () => openEditor(); $("#imp", top).onclick = openImport; }
+    $("#exp", top).onclick = openExport;
     const all = recipeList();
     const tags = [...new Set(all.flatMap(r => r.tags || []))].sort((a, b) => a.localeCompare(b, "sv"));
     const chips = h(`<div class="chips"></div>`);
@@ -650,7 +833,7 @@
 
   function openRecipe(id, dayIndex) {
     const r = recipeById(id); if (!r) return;
-    const rt = rating(id), eaten = eatenIndex()[id] || [];
+    const rt = rating(id), eaten = eatenIndex()[id] || [], edit = canEdit();
     const box = h(`<div>
       ${r.image ? `<img class="hero" src="${esc(r.image)}" alt="">` : ""}
       <h2>${esc(r.name)}</h2>
@@ -661,17 +844,22 @@
         ${rt.n ? `<div><b>★ ${fmtNum(rt.avg)}</b><span class="muted">${rt.n === 1 ? "1 betyg" : rt.n + " betyg"}</span></div>` : ""}
         <div><b>${eaten.length}</b><span class="muted">${eaten.length ? `ggr, senast ${fmtDate(eaten[0])}` : "ggr lagad"}</span></div>
       </div>
+      <div class="row actions"><button class="btn primary" id="cook">Laga</button><button class="btn" id="share">Dela</button><button class="btn" id="print">Skriv ut</button>${CLOUD ? `<button class="btn" id="suggest">Föreslå</button>` : ""}</div>
       <div class="rate"><span class="label">Ditt betyg</span></div>
-      ${dayIndex != null ? `<div class="section"><div class="label">${DAYS[dayIndex]} ${fmtDate(addDays(monday(), dayIndex))}</div>
+      ${dayIndex != null && edit ? `<div class="section"><div class="label">${DAYS[dayIndex]} ${fmtDate(addDays(monday(), dayIndex))}</div>
         <div class="row" style="margin-top:6px"><button class="btn primary" id="swap">Byt middag</button><button class="btn" id="unplan">Ta bort från dagen</button></div></div>` : ""}
       <div class="section"><h3>Ingredienser</h3><ul class="ingr">${(r.ingredients || []).map(x => `<li>${esc(x)}</li>`).join("") || "<li class='muted'>Inga ingredienser angivna</li>"}</ul></div>
       <div class="section"><h3>Gör så här</h3><ol class="steps">${(r.steps || []).map(x => `<li>${esc(x)}</li>`).join("") || "<li class='muted'>Ingen beskrivning</li>"}</ol></div>
       ${r.source ? `<p class="small muted section">Källa: <a href="${esc(r.source)}" target="_blank" rel="noopener">${esc(r.source.replace(/^https?:\/\/(www\.)?/, "").split("/")[0])}</a></p>` : ""}
       ${eaten.length > 1 ? `<details class="section"><summary class="small">Alla gånger ni ätit den</summary><p class="small muted">${eaten.map(fmtDateYear).join(", ")}</p></details>` : ""}
-      <div class="section"${dayIndex != null ? " hidden" : ""}><div class="label">Lägg på veckomenyn, vecka ${isoWeek(monday()).week}</div>
+      <div class="section"${dayIndex != null || !edit ? " hidden" : ""}><div class="label">Lägg på veckomenyn, vecka ${isoWeek(monday()).week}</div>
         <div class="row" style="margin-top:6px"><select id="addday" class="btn">${DAYS.map((d, i) => `<option value="${i}">${d} ${fmtDate(addDays(monday(), i))}</option>`).join("")}</select><button class="btn primary" id="addgo">Lägg till</button></div></div>
-      <div class="row section"><button class="btn" id="edit">Redigera</button>${CLOUD && store.families.length > 1 ? `<button class="btn" id="copyfam">Kopiera till annan familj</button>` : ""}<button class="btn danger" id="del">Ta bort</button></div></div>`);
+      <div class="row section">${edit ? `<button class="btn" id="edit">Redigera</button>` : ""}${CLOUD && store.families.length > 1 ? `<button class="btn" id="copyfam">Kopiera till annan familj</button>` : ""}${edit ? `<button class="btn danger" id="del">Ta bort</button>` : ""}</div></div>`);
     box.prepend(closeBtn());
+    $("#cook", box).onclick = () => openCook(r);
+    $("#share", box).onclick = () => shareRecipe(r);
+    $("#print", box).onclick = () => printRecipes([r]);
+    const sgb = $("#suggest", box); if (sgb) sgb.onclick = () => openSuggest({ recipeId: r.id });
     $(".rate", box).append(starsInput(rt.mine, v => { store.change({ k: "rt", id, stars: v }); toast(v ? `Du gav ${v} av 5` : "Betyget borttaget"); openRecipe(id, dayIndex); }));
     const others = Object.entries(store.ratings[id] || {}).filter(([uid, n]) => n && uid !== store.me && CLOUD);
     if (others.length) $(".rate", box).after(h(`<p class="small muted who">${others.map(([uid, n]) => `${esc((store.members[uid] && store.members[uid].name) || "Tidigare medlem")} ${"★".repeat(n)}`).join(" · ")}</p>`));
@@ -691,16 +879,16 @@
       });
       openSheet(b2);
     };
-    if (dayIndex != null) {
+    if (dayIndex != null && edit) {
       $("#swap", box).onclick = () => openPicker(dayIndex);
       $("#unplan", box).onclick = () => { setDay(dayIndex, { recipeId: "", note: "" }); closeSheet(); toast("Borttagen från " + DAYS[dayIndex].toLowerCase()); };
     }
     const firstEmpty = getWeek().days.findIndex(d => !d.recipeId && !d.note);
     if (firstEmpty >= 0) $("#addday", box).value = firstEmpty;
     $("#addgo", box).onclick = () => { const i = +$("#addday", box).value; setDay(i, { recipeId: r.id, note: "" }); closeSheet(); toast(`Tillagd på ${DAYS[i].toLowerCase()}`); };
-    $("#edit", box).onclick = () => openEditor(r);
+    if (edit) $("#edit", box).onclick = () => openEditor(r);
     const del = $("#del", box);
-    del.onclick = () => {
+    if (del) del.onclick = () => {
       if (!del.classList.contains("armed")) { del.classList.add("armed"); del.textContent = "Ja, ta bort receptet"; return; }
       deleteImage(r.image);
       store.change({ k: "rd", id: r.id }); closeSheet(); toast("Receptet är borttaget");
@@ -778,6 +966,161 @@
     openSheet(box, cleanup);
   }
 
+  // ---------- matlagningsläge ----------
+  let wakeLock = null, cookOpen = false;
+  async function keepAwake() {
+    try {
+      if (!("wakeLock" in navigator)) return false;
+      if (wakeLock && !wakeLock.released) return true;
+      wakeLock = await navigator.wakeLock.request("screen");
+      return true;
+    } catch { return false; }
+  }
+  function releaseAwake() { cookOpen = false; try { wakeLock && wakeLock.release(); } catch {} wakeLock = null; }
+  document.addEventListener("visibilitychange", () => { if (cookOpen && document.visibilityState === "visible") keepAwake(); });
+
+  function openCook(r) {
+    const box = h(`<div class="cook">
+      <div class="row spread cookhead"><span class="label" id="awake">Matlagningsläge</span></div>
+      <h2>${esc(r.name)}</h2>
+      ${r.time || r.servings ? `<p class="muted" style="margin:2px 0 0">${[r.time && r.time + " min", r.servings && r.servings + " portioner"].filter(Boolean).map(esc).join(" · ")}</p>` : ""}
+      <div class="section"><h3>Ingredienser</h3><p class="small muted" style="margin:0 0 6px">Tryck för att bocka av det du har tagit fram.</p><ul class="cook-ingr"></ul></div>
+      <div class="section"><h3>Gör så här</h3><p class="small muted" style="margin:0 0 6px">Tryck på steget du är på.</p><ol class="cook-steps"></ol></div>
+      <button class="btn wide" id="cookdone" style="margin-top:24px">Klar, stäng</button>
+    </div>`);
+    box.prepend(closeBtn());
+    (r.ingredients || []).forEach(x => {
+      const li = h(`<li><button type="button"><span class="box" aria-hidden="true"></span><span>${esc(x)}</span></button></li>`);
+      $("button", li).onclick = () => li.classList.toggle("done");
+      $(".cook-ingr", box).append(li);
+    });
+    const steps = $(".cook-steps", box);
+    (r.steps || []).forEach((x, i) => {
+      const li = h(`<li><button type="button">${esc(x)}</button></li>`);
+      $("button", li).onclick = () => {
+        [...steps.children].forEach((el, j) => { el.classList.toggle("done", j < i); el.classList.toggle("cur", j === i); });
+      };
+      steps.append(li);
+    });
+    if (steps.firstElementChild) steps.firstElementChild.classList.add("cur");
+    $("#cookdone", box).onclick = closeSheet;
+    openSheet(box, releaseAwake);
+    $(".shade").classList.add("full");
+    cookOpen = true;
+    keepAwake().then(ok => {
+      const a = $("#awake"); if (!a) return;
+      a.textContent = ok ? "☀︎ Skärmen hålls tänd" : "Matlagningsläge";
+      if (!ok) a.after(h(`<span class="small muted">Din telefon tillåter inte att skärmen hålls tänd (kräver iOS 18.4 eller senare).</span>`));
+    });
+  }
+
+  // ---------- dela, skriv ut och säkerhetskopiera ----------
+  function recipeText(r) {
+    const lines = [r.name];
+    const meta = [r.time && r.time + " min", r.servings && r.servings + " portioner"].filter(Boolean).join(" · ");
+    if (meta) lines.push(meta);
+    if ((r.ingredients || []).length) lines.push("", "Ingredienser", ...r.ingredients.map(x => "• " + x));
+    if ((r.steps || []).length) lines.push("", "Gör så här", ...r.steps.map((x, i) => `${i + 1}. ${x}`));
+    if (r.source) lines.push("", "Källa: " + r.source);
+    lines.push("", "Från Middagsboken");
+    return lines.join("\n");
+  }
+  async function copyText(text, okMsg) {
+    try { await navigator.clipboard.writeText(text); toast(okMsg); return true; } catch { return false; }
+  }
+  async function shareRecipe(r) {
+    const text = recipeText(r);
+    if (navigator.share) {
+      try { await navigator.share({ title: r.name, text }); return; }
+      catch (e) { if (e && e.name === "AbortError") return; }
+    }
+    if (!(await copyText(text, "Receptet är kopierat. Klistra in det där du vill dela det."))) {
+      const box = h(`<div><h2>Dela recept</h2><p class="small muted">Markera och kopiera texten.</p><textarea class="sharetext" readonly></textarea></div>`);
+      box.prepend(closeBtn()); $("textarea", box).value = text; openSheet(box); $("textarea", box).select();
+    }
+  }
+
+  function printRecipes(list, title) {
+    const area = $("#printarea") || document.body.appendChild(h(`<div id="printarea"></div>`));
+    area.innerHTML = `${title ? `<header class="pb-title"><h1>${esc(title)}</h1><p>${list.length} recept · ${fmtDateYear(new Date())}</p></header>` : ""}` +
+      list.map(r => `<article class="pr">
+        ${r.image ? `<img src="${esc(r.image)}" alt="">` : ""}
+        <h2>${esc(r.name)}</h2>
+        <p class="pm">${[r.time && r.time + " min", r.servings && r.servings + " portioner", ...(r.tags || [])].filter(Boolean).map(esc).join(" · ")}</p>
+        <div class="pcols"><section><h3>Ingredienser</h3><ul>${(r.ingredients || []).map(x => `<li>${esc(x)}</li>`).join("")}</ul></section>
+        <section><h3>Gör så här</h3><ol>${(r.steps || []).map(x => `<li>${esc(x)}</li>`).join("")}</ol></section></div>
+        ${r.source ? `<p class="pm">Källa: ${esc(r.source)}</p>` : ""}
+      </article>`).join("");
+    const box = h(`<div><h2>Skriv ut eller spara som PDF</h2>
+      <p class="small muted">${list.length === 1 ? "Receptet" : list.length + " recept"} läggs upp för utskrift på A4. På iPhone väljer du <b>Skriv ut</b>. För att spara som PDF trycker du sedan på <b>Dela</b> och väljer <b>Spara i Filer</b>.</p>
+      <button class="btn primary" id="doprint">Skriv ut</button>
+      <p class="small muted" style="margin-top:12px">Händer inget? Öppna appen i Safari i stället för från hemskärmen och försök igen.</p></div>`);
+    box.prepend(closeBtn());
+    $("#doprint", box).onclick = () => { closeSheet(); setTimeout(() => { try { window.print(); } catch { toast("Utskrift stöds inte här. Prova i Safari."); } }, 150); };
+    openSheet(box);
+  }
+
+  async function saveFile(name, text, type) {
+    const blob = new Blob([text], { type });
+    try {
+      const file = new File([blob], name, { type });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); return; }
+    } catch (e) { if (e && e.name === "AbortError") return; }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+  function exportBackup() {
+    const fam = store.current ? store.current.name : "Middagsboken";
+    const data = {
+      app: "Middagsboken", format: 1, exported: new Date().toISOString(), family: fam,
+      recipes: recipeList().map(({ id, ...r }) => r)
+    };
+    const day = new Date().toISOString().slice(0, 10);
+    const slug = fam.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "recept";
+    saveFile(`middagsboken-${slug}-${day}.json`, JSON.stringify(data, null, 2), "application/json");
+  }
+  function importBackup(file) {
+    const fr = new FileReader();
+    fr.onload = () => {
+      let data;
+      try { data = JSON.parse(fr.result); } catch { toast("Filen gick inte att läsa. Välj en säkerhetskopia från Middagsboken."); return; }
+      const list = Array.isArray(data) ? data : data && data.recipes;
+      if (!Array.isArray(list)) { toast("Filen innehåller inga recept."); return; }
+      const have = new Set(recipeList().map(r => r.name.trim().toLowerCase()));
+      let added = 0, skipped = 0;
+      list.forEach(x => {
+        if (!x || typeof x.name !== "string" || !x.name.trim()) return;
+        if (have.has(x.name.trim().toLowerCase())) { skipped++; return; }
+        const arr = v => Array.isArray(v) ? v.map(String).filter(Boolean) : [];
+        store.change({ k: "r", id: newId(), data: {
+          name: x.name.trim().slice(0, 120), time: String(x.time || ""), servings: Math.max(1, +x.servings || 4),
+          tags: arr(x.tags), ingredients: arr(x.ingredients), steps: arr(x.steps),
+          image: typeof x.image === "string" ? x.image : "", source: typeof x.source === "string" ? x.source : ""
+        } });
+        have.add(x.name.trim().toLowerCase()); added++;
+      });
+      closeSheet();
+      toast(`${added} recept importerade${skipped ? `, ${skipped} fanns redan` : ""}`);
+    };
+    fr.readAsText(file);
+  }
+  function openExport() {
+    const n = recipeList().length;
+    const box = h(`<div><h2>Exportera</h2>
+      <div class="section" style="margin-top:12px"><h3>Säkerhetskopia</h3>
+        <p class="small muted" style="margin:0 0 8px">Alla ${n} recept i en fil som du kan spara i Filer, iCloud eller mejla till dig själv. Den kan importeras tillbaka, även till en annan familj. Bilder sparas som länkar.</p>
+        <button class="btn primary" id="xb">Spara säkerhetskopia</button></div>
+      <div class="section"><h3>Receptbok</h3>
+        <p class="small muted" style="margin:0 0 8px">Alla recept uppställda för utskrift, eller för att spara som en PDF.</p>
+        <button class="btn" id="xp">Skriv ut receptbok</button></div>
+      <p class="small muted section">Vill du dela ett enda recept? Öppna receptet och tryck <b>Dela</b>.</p></div>`);
+    box.prepend(closeBtn());
+    $("#xb", box).onclick = exportBackup;
+    $("#xp", box).onclick = () => printRecipes(recipeList(), (store.current ? store.current.name : "Middagsboken") + " · Recept");
+    openSheet(box);
+  }
+
   // ---------- import ----------
   function openImport() {
     const box = h(`<div>
@@ -790,6 +1133,9 @@
         <p class="small muted" style="margin:0 0 8px">Kopiera ett recept från en sida, ett mejl eller en anteckning. Första raden blir namnet. Rader med mängd, som "2 dl grädde", blir ingredienser och resten blir steg.</p>
         <div class="field"><textarea id="itext" placeholder="Pasta carbonara&#10;400 g spaghetti&#10;150 g bacon&#10;3 äggulor&#10;Koka pastan.&#10;Stek baconet…"></textarea></div>
         <button class="btn" id="iparse">Tolka texten</button></div>
+      <div class="section"><h3>Från säkerhetskopia</h3>
+        <p class="small muted" style="margin:0 0 8px">Välj en fil som exporterats från Middagsboken. Recept med samma namn som ett befintligt hoppas över.</p>
+        <label class="btn" for="ifile">Välj fil</label><input id="ifile" type="file" accept=".json,application/json" hidden></div>
     </div>`);
     box.prepend(closeBtn());
     const err = t => { const p = $("#ierr", box); p.hidden = !t; p.textContent = t || ""; };
@@ -815,6 +1161,7 @@
     };
     $("#igo", box).onclick = go;
     $("#iurl", box).onkeydown = e => { if (e.key === "Enter") go(); };
+    $("#ifile", box).onchange = e => { const f = e.target.files && e.target.files[0]; if (f) importBackup(f); };
     $("#iparse", box).onclick = () => {
       const r = parseRecipeText($("#itext", box).value);
       if (!r) { toast("Klistra in ett recept först"); return; }
@@ -883,47 +1230,88 @@
   }
   function renderShop(main) {
     main.append(weekNav());
-    const wk = getWeek(), items = buildShop(wk), checked = new Set(wk.checked);
+    const wk = getWeek(), sh = getShop(), items = buildShop(wk), checked = new Set(sh.checked), edits = sh.edits;
+    const save = patch => putShop({ ...getShop(), ...patch });
     const toggle = key => {
-      const w = getWeek(); const s = new Set(w.checked); s.has(key) ? s.delete(key) : s.add(key);
-      putWeek({ ...w, checked: [...s] });
+      const s2 = new Set(getShop().checked); s2.has(key) ? s2.delete(key) : s2.add(key);
+      save({ checked: [...s2] });
     };
     const planned = wk.days.filter(d => d.recipeId && recipeById(d.recipeId)).length;
-    main.append(h(`<p class="muted" style="margin:0 0 12px">${planned ? `Ingredienser för ${planned} middagar, beräknat för ${wk.servings} personer.` : "Planera veckans middagar först, så fylls listan i automatiskt."}</p>`));
-    if (items.length) {
-      const left = items.filter(i => !checked.has(i.key)).length;
+    main.append(h(`<p class="muted" style="margin:0 0 12px">${planned ? `Ingredienser för ${planned === 1 ? "1 middag" : planned + " middagar"}, beräknat för ${wk.servings} personer. Tryck ✎ för att ändra en vara.` : "Planera veckans middagar först, så fylls listan i automatiskt."}</p>`));
+    const label = it => {
+      const e = edits[it.key];
+      if (e && e.text) return `${esc(e.text)} <span class="edited">ändrad</span>`;
+      const amt = it.qty ? fmtNum(it.qty) + (it.unit ? " " + it.unit : "") : "";
+      return it.text.length && !it.qty ? esc(it.text.join(", ")) : `${amt ? `<span class="amt">${esc(amt)}</span>` : ""}${esc(it.name)}${it.text.length ? " + " + esc(it.text.join(", ")) : ""}`;
+    };
+    const plain = it => {
+      const amt = it.qty ? fmtNum(it.qty) + (it.unit ? " " + it.unit : "") + " " : "";
+      return it.text.length && !it.qty ? it.text.join(", ") : amt + it.name + (it.text.length ? " + " + it.text.join(", ") : "");
+    };
+    const visible = items.filter(it => !(edits[it.key] && edits[it.key].hidden));
+    const hidden = items.filter(it => edits[it.key] && edits[it.key].hidden);
+    if (visible.length) {
+      const left = visible.filter(i => !checked.has(i.key)).length;
       main.append(h(`<div class="label" style="margin-bottom:4px">${left} kvar att handla</div>`));
       const ul = h(`<ul class="shop"></ul>`);
-      items.sort((a, b) => checked.has(a.key) - checked.has(b.key)).forEach((it, n) => {
-        const amt = it.qty ? fmtNum(it.qty) + (it.unit ? " " + it.unit : "") : "";
-        const label = it.text.length && !it.qty ? esc(it.text.join(", ")) : `${amt ? `<span class="amt">${esc(amt)}</span>` : ""}${esc(it.name)}${it.text.length ? " + " + esc(it.text.join(", ")) : ""}`;
-        const li = h(`<li class="${checked.has(it.key) ? "done" : ""}"><input type="checkbox" id="s${n}" ${checked.has(it.key) ? "checked" : ""}><label for="s${n}">${label}<span class="from">${[...it.from].join(", ")}</span></label></li>`);
+      visible.sort((a, b) => checked.has(a.key) - checked.has(b.key)).forEach((it, n) => {
+        const li = h(`<li class="${checked.has(it.key) ? "done" : ""}"><input type="checkbox" id="s${n}" ${checked.has(it.key) ? "checked" : ""}><label for="s${n}">${label(it)}<span class="from">${[...it.from].join(", ")}</span></label><button class="x" aria-label="Ändra">✎</button></li>`);
         $("input", li).onchange = () => toggle(it.key);
+        $(".x", li).onclick = () => editShopItem(it, plain(it));
         ul.append(li);
       });
       main.append(ul);
     }
+    if (hidden.length) {
+      const d = h(`<details class="section hiddenitems"><summary class="small">Har hemma (${hidden.length})</summary><ul class="shop"></ul></details>`);
+      hidden.forEach(it => {
+        const li = h(`<li><span class="lbl">${label(it)}</span><button class="btn small">Lägg tillbaka</button></li>`);
+        $("button", li).onclick = () => { const e2 = { ...getShop().edits }; const cur = { ...(e2[it.key] || {}) }; delete cur.hidden; if (Object.keys(cur).length) e2[it.key] = cur; else delete e2[it.key]; save({ edits: e2 }); };
+        $("ul", d).append(li);
+      });
+      main.append(d);
+    }
     const sec = h(`<div class="section"><h3>Övrigt att handla</h3><ul class="shop"></ul>
       <form class="addline"><input id="extra" placeholder="T.ex. Mjölk, kaffe, tandkräm" enterkeyhint="done"><button class="btn" type="submit">Lägg till</button></form></div>`);
     const eul = $("ul", sec);
-    wk.extras.forEach((x, i) => {
+    sh.extras.forEach((x, i) => {
       const key = "extra:" + x;
       const li = h(`<li class="${checked.has(key) ? "done" : ""}"><input type="checkbox" id="e${i}" ${checked.has(key) ? "checked" : ""}><label for="e${i}">${esc(x)}</label><button class="x" aria-label="Ta bort ${esc(x)}">✕</button></li>`);
       $("input", li).onchange = () => toggle(key);
-      $(".x", li).onclick = () => { const w = getWeek(); putWeek({ ...w, extras: w.extras.filter(e => e !== x), checked: w.checked.filter(c => c !== key) }); };
+      $(".x", li).onclick = () => { const c = getShop(); save({ extras: c.extras.filter(e => e !== x), checked: c.checked.filter(k => k !== key) }); };
       eul.append(li);
     });
     $("form", sec).onsubmit = e => {
       e.preventDefault(); const v = $("#extra", sec).value.trim(); if (!v) return;
-      const w = getWeek(); if (!w.extras.includes(v)) putWeek({ ...w, extras: [...w.extras, v] });
+      const c = getShop(); if (!c.extras.includes(v)) save({ extras: [...c.extras, v] });
       setTimeout(() => { const f = $("#extra"); if (f) f.focus(); }, 0);
     };
     main.append(sec);
     if (checked.size) {
-      const b = h(`<button class="btn" style="margin-top:18px">Avmarkera allt</button>`);
-      b.onclick = () => putWeek({ ...getWeek(), checked: [] });
-      main.append(b);
+      const b2 = h(`<button class="btn" style="margin-top:18px">Avmarkera allt</button>`);
+      b2.onclick = () => save({ checked: [] });
+      main.append(b2);
     }
+  }
+
+  function editShopItem(it, original) {
+    const cur = (getShop().edits[it.key] || {});
+    const box = h(`<form><h2>Ändra vara</h2>
+      <p class="small muted" style="margin:0 0 10px">Från receptet: ${esc(original)}</p>
+      <div class="field"><label for="se">Det här ska stå på listan</label><input id="se" value="${esc(cur.text || original)}" maxlength="80"></div>
+      <div class="row"><button class="btn primary" type="submit">Spara</button><button class="btn" type="button" id="home">Har hemma</button>${cur.text ? `<button class="btn" type="button" id="reset">Återställ</button>` : ""}</div>
+      <p class="small muted" style="margin-top:12px">Ändringen gäller bara den här veckans lista. Receptet ändras inte.</p></form>`);
+    box.prepend(closeBtn());
+    const setEdit = patch => {
+      const e2 = { ...getShop().edits }; const next = { ...(e2[it.key] || {}), ...patch };
+      Object.keys(next).forEach(k => { if (next[k] === undefined || next[k] === "") delete next[k]; });
+      if (Object.keys(next).length) e2[it.key] = next; else delete e2[it.key];
+      putShop({ ...getShop(), edits: e2 });
+    };
+    box.onsubmit = e => { e.preventDefault(); const v = $("#se", box).value.trim(); setEdit({ text: v && v !== original ? v : undefined }); closeSheet(); };
+    $("#home", box).onclick = () => { setEdit({ hidden: true }); closeSheet(); toast("Flyttad till Har hemma"); };
+    const rs = $("#reset", box); if (rs) rs.onclick = () => { setEdit({ text: undefined }); closeSheet(); };
+    openSheet(box);
   }
 
   // ---------- sidhuvud ----------
@@ -1058,7 +1446,12 @@
         <p class="small muted linktext" id="lt">${esc(inviteLink(f.invite_code))}</p>
       </div>
 
-      <div class="section"><h3>Medlemmar</h3><ul class="members"></ul></div>
+      <div class="section"><h3>Medlemmar</h3>
+        <p class="small muted" style="margin:0 0 4px"><b>Medlem</b> ser allt, betygsätter, bockar av inköpslistan och föreslår middagar. <b>Redigerare</b> ändrar också menyer och recept. <b>Ägare</b> hanterar dessutom familjen. Nya medlemmar börjar som Medlem.</p>
+        <ul class="members"></ul></div>
+      ${owner ? `<div class="section"><h3>Väggskärm</h3>
+        <p class="small muted" style="margin:0 0 8px">En egen sida som bara visar veckans meny, till exempel på en surfplatta med Home Assistant. Den behöver ingen inloggning, så dela bara länken med skärmen.</p>
+        <div id="disp"></div></div>` : ""}
 
       ${store.families.length > 1 ? `<div class="section"><h3>Dina familjer</h3><ul class="famlist"></ul></div>` : ""}
 
@@ -1070,14 +1463,17 @@
     const ul = $(".members", box);
     ids.forEach(uid => {
       const m = store.members[uid], me = uid === store.me;
-      const li = h(`<li><span class="mname">${esc(m.name || "Namnlös")}${me ? " <span class='muted'>(du)</span>" : ""}</span>${m.role === "owner" ? `<span class="tag">Ägare</span>` : ""}<span class="mact"></span></li>`);
+      const li = h(`<li><span class="mname">${esc(m.name || "Namnlös")}${me ? " <span class='muted'>(du)</span>" : ""}</span><span class="mact"></span></li>`);
+      const act = $(".mact", li);
+      if (owner && !(me && !ids.some(x => x !== uid && store.members[x].role === "owner"))) {
+        const sel = h(`<select class="btn small" aria-label="Roll för ${esc(m.name || "")}">${Object.entries(ROLE_NAMES).map(([k, v]) => `<option value="${k}"${m.role === k ? " selected" : ""}>${v}</option>`).join("")}</select>`);
+        sel.onchange = async () => {
+          try { await rpc("set_member_role", { fid: f.id, uid, p_role: sel.value }); await store.refreshMembers(); openFamily(); toast(`${m.name || "Medlemmen"} är nu ${ROLE_NAMES[sel.value].toLowerCase()}`); }
+          catch (e) { toast(rpcError(e, "Rollen kunde inte ändras.")); openFamily(); }
+        };
+        act.append(sel);
+      } else act.append(h(`<span class="tag">${ROLE_NAMES[m.role] || "Medlem"}</span>`));
       if (owner && !me) {
-        const act = $(".mact", li);
-        if (m.role !== "owner") {
-          const up = h(`<button class="btn small">Gör till ägare</button>`);
-          up.onclick = async () => { try { await rpc("set_member_role", { fid: f.id, uid, p_role: "owner" }); await store.refreshMembers(); openFamily(); } catch (e) { toast(rpcError(e, "Det gick inte.")); } };
-          act.append(up);
-        }
         const rm = h(`<button class="btn small danger">Ta bort</button>`);
         rm.onclick = async () => {
           if (!rm.classList.contains("armed")) { rm.classList.add("armed"); rm.textContent = "Ja, ta bort"; return; }
@@ -1097,6 +1493,28 @@
       fl.append(li);
     });
 
+    const disp = $("#disp", box);
+    if (disp) {
+      const url = f.display_key ? new URL("visa.html?nyckel=" + f.display_key, location.href).href : "";
+      if (url) {
+        disp.append(h(`<div><p class="small linktext">${esc(url)}</p><div class="row" style="margin-top:8px"><button class="btn" id="dcopy">Kopiera länk</button><a class="btn" href="${esc(url)}" target="_blank" rel="noopener">Öppna</a><button class="btn danger" id="dnew">Ny länk</button><button class="btn danger" id="doff">Stäng av</button></div></div>`));
+        $("#dcopy", disp).onclick = () => copyText(url, "Länken är kopierad");
+        const dn = $("#dnew", disp);
+        dn.onclick = async () => {
+          if (!dn.classList.contains("armed")) { dn.classList.add("armed"); dn.textContent = "Ja, ny länk"; toast("Den gamla länken slutar fungera"); return; }
+          try { await rpc("new_display_key", { fid: f.id }); await store.loadFamilies(); openFamily(); } catch (e) { toast(rpcError(e, "Det gick inte.")); }
+        };
+        const off = $("#doff", disp);
+        off.onclick = async () => {
+          if (!off.classList.contains("armed")) { off.classList.add("armed"); off.textContent = "Ja, stäng av"; return; }
+          try { await rpc("remove_display_key", { fid: f.id }); await store.loadFamilies(); openFamily(); toast("Väggskärmen är avstängd"); } catch (e) { toast(rpcError(e, "Det gick inte.")); }
+        };
+      } else {
+        const on = h(`<button class="btn primary">Skapa länk till väggskärm</button>`);
+        on.onclick = async () => { try { await rpc("new_display_key", { fid: f.id }); await store.loadFamilies(); openFamily(); } catch (e) { toast(rpcError(e, "Det gick inte att skapa länken.")); } };
+        disp.append(on);
+      }
+    }
     const rn = $("#rn", box);
     if (rn) rn.onsubmit = async e => {
       e.preventDefault(); const name = $("#rnn", box).value.trim(); if (!name || name === f.name) return;

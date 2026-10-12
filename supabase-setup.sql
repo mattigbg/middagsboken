@@ -295,3 +295,187 @@ do $$ begin
 exception when duplicate_object then null; end $$;
 
 notify pgrst, 'reload schema';
+
+-- =====================================================================
+-- Version 4: roller, egen inköpslista, förslag och väggskärm.
+-- Ofarligt att köra flera gånger.
+-- =====================================================================
+
+create table if not exists public.app_migrations (name text primary key, done_at timestamptz default now());
+alter table public.app_migrations enable row level security;
+
+-- 12. Roller: ägare, redigerare och medlem
+alter table public.family_members drop constraint if exists family_members_role_check;
+alter table public.family_members add constraint family_members_role_check check (role in ('owner', 'editor', 'member'));
+
+-- De som redan var med när rollerna infördes får fortsätta redigera (görs bara en gång)
+do $$ begin
+  if not exists (select 1 from public.app_migrations where name = 'v4_roller') then
+    update public.family_members set role = 'editor' where role = 'member';
+    insert into public.app_migrations (name) values ('v4_roller');
+  end if;
+end $$;
+
+create or replace function public.can_edit(fid uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from family_members where family_id = fid and user_id = auth.uid() and role in ('owner', 'editor'));
+$$;
+
+drop policy if exists "Familjen får allt" on public.recipes;
+drop policy if exists "Familjen ser recept" on public.recipes;
+create policy "Familjen ser recept" on public.recipes for select to authenticated using (public.is_member(family_id));
+drop policy if exists "Redigerare ändrar recept" on public.recipes;
+create policy "Redigerare ändrar recept" on public.recipes for all to authenticated
+  using (public.can_edit(family_id)) with check (public.can_edit(family_id));
+
+drop policy if exists "Familjen får allt" on public.weeks;
+drop policy if exists "Familjen ser menyer" on public.weeks;
+create policy "Familjen ser menyer" on public.weeks for select to authenticated using (public.is_member(family_id));
+drop policy if exists "Redigerare ändrar menyer" on public.weeks;
+create policy "Redigerare ändrar menyer" on public.weeks for all to authenticated
+  using (public.can_edit(family_id)) with check (public.can_edit(family_id));
+
+create or replace function public.set_member_role(fid uuid, uid uuid, p_role text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_owner(fid) then raise exception 'Bara ägaren kan ändra roller'; end if;
+  if p_role not in ('owner', 'editor', 'member') then raise exception 'Okänd roll'; end if;
+  if uid = auth.uid() and p_role <> 'owner'
+     and not exists (select 1 from family_members where family_id = fid and role = 'owner' and user_id <> uid) then
+    raise exception 'Familjen måste ha minst en ägare';
+  end if;
+  update family_members set role = p_role where family_id = fid and user_id = uid;
+end $$;
+
+-- 13. Inköpslistan: alla i familjen kan bocka av och ändra
+create table if not exists public.shopping (
+  family_id  uuid not null references public.families(id) on delete cascade,
+  week_id    text not null,
+  checked    jsonb not null default '[]'::jsonb,
+  extras     jsonb not null default '[]'::jsonb,
+  edits      jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now(),
+  primary key (family_id, week_id)
+);
+alter table public.shopping enable row level security;
+drop policy if exists "Familjen handlar" on public.shopping;
+create policy "Familjen handlar" on public.shopping for all to authenticated
+  using (public.is_member(family_id)) with check (public.is_member(family_id));
+
+do $$ begin
+  if not exists (select 1 from public.app_migrations where name = 'v4_inkop') then
+    insert into public.shopping (family_id, week_id, checked, extras)
+      select family_id, id, coalesce(data->'checked', '[]'::jsonb), coalesce(data->'extras', '[]'::jsonb)
+      from public.weeks
+      where jsonb_array_length(coalesce(data->'checked', '[]'::jsonb)) > 0
+         or jsonb_array_length(coalesce(data->'extras', '[]'::jsonb)) > 0
+      on conflict do nothing;
+    insert into public.app_migrations (name) values ('v4_inkop');
+  end if;
+end $$;
+
+-- 14. Förslagslådan
+create table if not exists public.suggestions (
+  id         uuid primary key default gen_random_uuid(),
+  family_id  uuid not null references public.families(id) on delete cascade,
+  user_id    uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  recipe_id  text references public.recipes(id) on delete set null,
+  text       text not null default '',
+  week_id    text,
+  day        integer check (day between 0 and 6),
+  votes      uuid[] not null default '{}',
+  status     text not null default 'open' check (status in ('open', 'done', 'dismissed')),
+  created_at timestamptz default now()
+);
+create index if not exists suggestions_family_idx on public.suggestions (family_id, status);
+alter table public.suggestions enable row level security;
+
+drop policy if exists "Familjen ser förslag" on public.suggestions;
+create policy "Familjen ser förslag" on public.suggestions for select to authenticated using (public.is_member(family_id));
+drop policy if exists "Alla föreslår" on public.suggestions;
+create policy "Alla föreslår" on public.suggestions for insert to authenticated
+  with check (public.is_member(family_id) and user_id = auth.uid() and status = 'open' and votes = '{}');
+drop policy if exists "Redigerare hanterar förslag" on public.suggestions;
+create policy "Redigerare hanterar förslag" on public.suggestions for update to authenticated
+  using (public.can_edit(family_id)) with check (public.can_edit(family_id));
+drop policy if exists "Ta bort förslag" on public.suggestions;
+create policy "Ta bort förslag" on public.suggestions for delete to authenticated
+  using (user_id = auth.uid() or public.can_edit(family_id));
+
+create or replace function public.toggle_vote(sid uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare fid uuid;
+begin
+  select family_id into fid from suggestions where id = sid;
+  if fid is null or not is_member(fid) then raise exception 'Förslaget finns inte'; end if;
+  update suggestions
+     set votes = case when auth.uid() = any(votes) then array_remove(votes, auth.uid()) else array_append(votes, auth.uid()) end
+   where id = sid;
+end $$;
+
+-- 15. Väggskärm: en hemlig nyckel som bara kan läsa veckomenyn
+alter table public.families add column if not exists display_key text unique;
+
+create or replace function public.new_display_key(fid uuid)
+returns text language plpgsql security definer set search_path = public as $$
+declare k text;
+begin
+  if not is_owner(fid) then raise exception 'Bara ägaren kan skapa visningsnyckel'; end if;
+  k := md5(random()::text || clock_timestamp()::text) || substr(md5(random()::text), 1, 8);
+  update families set display_key = k where id = fid;
+  return k;
+end $$;
+
+create or replace function public.remove_display_key(fid uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_owner(fid) then raise exception 'Bara ägaren kan ta bort visningsnyckeln'; end if;
+  update families set display_key = null where id = fid;
+end $$;
+
+create or replace function public.public_menu(p_key text, p_weeks text[])
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare fam families; result jsonb;
+begin
+  if p_key is null or length(p_key) < 20 then return null; end if;
+  select * into fam from families where display_key = p_key;
+  if fam.id is null then return null; end if;
+  select jsonb_build_object(
+    'family', fam.name,
+    'weeks', coalesce(jsonb_object_agg(w.id, (
+      select jsonb_agg(jsonb_build_object(
+        'note', coalesce(d.value->>'note', ''),
+        'name', r.name, 'image', coalesce(r.image, ''), 'time', coalesce(r.time, ''), 'tags', coalesce(r.tags, '[]'::jsonb)
+      ) order by d.ordinality)
+      from jsonb_array_elements(coalesce(w.data->'days', '[]'::jsonb)) with ordinality d
+      left join recipes r on r.id = d.value->>'recipeId' and r.family_id = fam.id
+    )), '{}'::jsonb)
+  ) into result
+  from weeks w where w.family_id = fam.id and w.id = any(p_weeks[1:4]);
+  return coalesce(result, jsonb_build_object('family', fam.name, 'weeks', '{}'::jsonb));
+end $$;
+
+create or replace function public.join_family(p_code text, p_display text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare fid uuid;
+begin
+  if auth.uid() is null then raise exception 'Inte inloggad'; end if;
+  select id into fid from families where invite_code = upper(trim(p_code));
+  if fid is null then raise exception 'Okänd kod'; end if;
+  insert into family_members (family_id, user_id, role, display_name)
+    values (fid, auth.uid(), 'member', coalesce(trim(p_display), ''))
+    on conflict (family_id, user_id) do nothing;
+  return fid;
+end $$;
+
+revoke execute on function public.public_menu(text, text[]) from public;
+grant execute on function public.public_menu(text, text[]) to anon, authenticated;
+grant execute on function public.can_edit(uuid), public.toggle_vote(uuid), public.new_display_key(uuid),
+  public.remove_display_key(uuid), public.set_member_role(uuid, uuid, text) to authenticated;
+
+do $$ begin alter publication supabase_realtime add table public.shopping;
+exception when duplicate_object then null; end $$;
+do $$ begin alter publication supabase_realtime add table public.suggestions;
+exception when duplicate_object then null; end $$;
+
+notify pgrst, 'reload schema';
