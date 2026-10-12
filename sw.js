@@ -1,6 +1,6 @@
 // Gör att appen startar även utan internet.
 // Öka versionen när appens filer ändras, så hämtar telefonerna den nya versionen.
-const VERSION = "middagsboken-v4";
+const VERSION = "middagsboken-v5";
 const IMAGES = "middagsboken-bilder";
 const SHELL = [
   "./",
@@ -19,7 +19,9 @@ const SHELL = [
 ];
 
 self.addEventListener("install", e => {
-  e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(VERSION)
+    .then(c => c.addAll(SHELL.map(u => new Request(u, { cache: "reload" }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener("activate", e => {
@@ -60,9 +62,9 @@ self.addEventListener("fetch", e => {
 
   if (url.origin !== location.origin) return;
 
-  // Appens egna filer: försök nätet först (så uppdateringar kommer fram), annars sparad kopia.
+  // Appens egna filer: hämta alltid färskt från nätet (förbi webbläsarens cache), annars sparad kopia.
   e.respondWith(
-    fetch(req)
+    fetch(req, { cache: "no-cache" })
       .then(res => { const copy = res.clone(); caches.open(VERSION).then(c => c.put(req, copy)); return res; })
       .catch(() => caches.match(req, { ignoreSearch: true }).then(hit => hit || caches.match("index.html")))
   );

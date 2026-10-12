@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "4";
+  const APP_VERSION = "4.1";
 
   // ---------- hjälpfunktioner ----------
   const DAYS = ["Måndag", "Tisdag", "Onsdag", "Torsdag", "Fredag", "Lördag", "Söndag"];
@@ -1591,6 +1591,13 @@
       }
       const rf = h(`<button class="btn">Uppdatera nu</button>`);
       rf.onclick = async () => { rf.disabled = true; store.needsDbUpdate = false; await store.loadFamilies(); await store.refresh(); closeSheet(); toast("Uppdaterad"); };
+      const up = h(`<button class="btn">Sök efter ny version</button>`);
+      up.onclick = async () => {
+        up.disabled = true; up.textContent = "Söker…";
+        try { const reg = await navigator.serviceWorker.getRegistration(); if (reg) await reg.update(); } catch {}
+        setTimeout(() => location.reload(), 800);
+      };
+      acts.append(up);
       const pw = h(`<button class="btn">Byt lösenord</button>`);
       pw.onclick = () => openNewPassword(false);
       const out = h(`<button class="btn danger">Logga ut</button>`);
